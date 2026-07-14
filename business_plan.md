@@ -80,7 +80,7 @@ fluiq.eval(metrics=["hallucination", "relevance"], mode="warn")
 
 That setup activates:
 - **Real-time trace collection** — every prompt, response, latency, cost, and token count
-- **Automatic evaluation** — LLM-judge scoring for hallucination, faithfulness, relevance
+- **Automatic evaluation** — LLM-judge scoring for hallucination, faithfulness, relevance, toxicity, coherence, plus **agentic evaluation** of whole agent runs (tool-selection correctness, trajectory/goal-completion, and multi-agent coordination), with judge **calibration** against a human golden set
 - **Security scanning** — PII, prompt injection, jailbreak, skeleton key, secrets, indirect injection, plus agentic threats (RAG poisoning, tool-input exfiltration, tool-allowlist violations, cross-agent injection, trust-boundary escalation) and a response gate
 - **Cost optimization** — semantic Redis cache + provider-level prompt prefix caching (Anthropic auto-injection, OpenAI/Gemini token capture) + MCP tool result caching
 
@@ -387,9 +387,10 @@ This unified data model deepens as usage grows, making churn progressively harde
 
 ### 8.1 Pricing Philosophy
 
-- **Free forever** for individual developers and small projects — drives top-of-funnel adoption
-- **Usage-based** at scale — aligns our revenue with customer value
-- **Optimization unlocks at Team; security unlocks at Growth** — the two paid value drivers ladder customers up the plans
+- **Observability is free and unlimited on every tier** — no trace/span/agent cap, ever. This is the top-of-funnel: teams instrument freely and only feel a paid boundary once they need history.
+- **Retention is the primary paid axis** — Free keeps a rolling 14-day window; paid keeps traces forever. Simple to explain, and it converts on genuine need (incident forensics, regression datasets, compliance) rather than an artificial cap.
+- **Optimization unlocks at Team; security unlocks at Growth** — the two additional paid value drivers ladder customers up the plans
+- **A no-card 5-day trial** of a paid tier lets teams feel unlimited retention (and higher eval budgets) before deciding
 - Simple, transparent pricing — no "contact sales" required below Enterprise
 
 ---
@@ -403,10 +404,11 @@ Full observability for your first pipeline. No credit card required.
 
 | Feature | Detail |
 |---|---|
-| Traces | **50,000 / month** (resets monthly; over-cap ingest returns 402) |
+| Traces | **Unlimited** (free, uncapped — on every tier) |
+| Trace retention | 14 days (rolling window) |
 | LLM-as-judge evaluations | 1,000 / month |
 | Seats | 1 |
-| Trace retention | 7 days |
+| Paid trial | 5-day, no-card trial of Team or Growth |
 | Supported providers | OpenAI, Anthropic, Gemini, Vertex AI, Voyage; LangChain, LangGraph, LlamaIndex, CrewAI, Google ADK, MCP; all vectorstores |
 | Trace explorer & live dashboard | ✅ |
 | `fluiq.eval()` (warn mode) + GitHub Action CI/CD eval gates | ✅ |
@@ -424,9 +426,9 @@ Unlimited tracing, response caching, and provider prompt caching for teams shipp
 | Feature | Detail |
 |---|---|
 | Tracing | Unlimited |
+| Trace retention | **Forever** (never-expiring) |
 | LLM-as-judge evaluations | 10,000 / month |
 | Seats | 10 (+ $49 / extra seat) |
-| Trace retention | 90 days |
 | Everything in Free | ✅ |
 | `fluiq.optimize()` — Redis cache + Anthropic prompt-prefix injection + MCP caching | ✅ |
 | Eval alerts to Slack | ✅ |
@@ -438,14 +440,14 @@ Unlimited tracing, response caching, and provider prompt caching for teams shipp
 #### Growth
 **$1,499 / workspace / month**
 
-Full security suite, higher eval throughput, and longer retention for production-scale, compliance-sensitive pipelines.
+Full security suite and higher eval throughput for production-scale, compliance-sensitive pipelines.
 
 | Feature | Detail |
 |---|---|
 | Tracing | Unlimited |
+| Trace retention | **Forever** (never-expiring) |
 | LLM-as-judge evaluations | 100,000 / month |
 | Seats | 20 (+ $39 / extra seat) |
-| Trace retention | 180 days |
 | Everything in Team | ✅ |
 | `fluiq.secure()` — PII, injection, jailbreak, secrets, agentic threats, response gate | ✅ |
 | Guardrail policies (dashboard-configurable) | ✅ |
@@ -507,7 +509,7 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 **Tactics:**
 
 1. **In-product upgrade triggers**
-   - When a free user hits the 50,000/month trace cap: graceful 402 with one-click upgrade to Team for unlimited tracing
+   - When a free user needs trace history beyond the rolling 14-day window: one-click upgrade to Team for unlimited (never-expiring) trace retention
    - When `fluiq.optimize()` is called below Team, or `fluiq.secure()` below Growth: graceful 402 with a one-click upgrade to the unlocking plan
    - When an LLM eval quota is exhausted mid-month: prompt to upgrade
 
@@ -623,7 +625,7 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 - **Auth & admin**: password + Google/GitHub OAuth, OTP password reset, tamper-evident (HMAC) audit log, admin console
 - **Marketing surfaces**: in-house blog CMS (prerender-on-publish SEO, S3 media), LLM cost calculator, pillar + competitor-comparison pages
 - **Dashboard**: 13+ pages, real-time SSE streaming, dark mode, full observe/secure/eval/optimize coverage
-- **Async pipeline & infra**: three Kafka workers (tracer, evaluator, security); AWS MSK (SASL/SCRAM/TLS), self-hosted ClickHouse on EC2, PostgreSQL on RDS, Redis, S3; cost estimation with provider rates
+- **Async pipeline & infra**: three Kafka workers (tracer, evaluator, security); self-hosted Kafka on EC2 (migrated off MSK to cut ~87% of that line item), self-hosted ClickHouse on EC2, PostgreSQL on RDS, Redis, S3; per-run roll-ups (AggregatingMergeTree); Fargate-Spot autoscaling to a ~$150/mo budget; cost estimation with provider rates
 
 ### 11.2 Roadmap
 
@@ -642,16 +644,18 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 - ~~Infra migration: MSK, ClickHouse-on-EC2, RDS~~
 - ~~Blog CMS + LLM cost calculator + comparison/pillar pages~~
 
-**H2 2026 — Enterprise & Platform Depth (In Progress / Next)**
-- Enterprise plan GA; SSO / SAML & SCIM
-- SOC 2 Type I certification
-- Self-hosted / VPC deployment option
-- Agent flow DAG visualization (tool-level selection already shipped)
-- A/B testing for prompts; multi-modal tracing (image, audio)
+**H2 2026 — Agentic Depth & Platform (Shipping)**
+- ~~Free, unlimited observability on every tier; retention as the paid axis (14-day Free / forever paid) + no-card 5-day trial~~
+- ~~Multi-agent DAG tracing & visualization (LangGraph / CrewAI / Google ADK fan-out + join detection; agentic evaluator L0–L5)~~
+- ~~Multimodal tracing via payload-free media references (image, audio, file)~~
+- ~~Dataset trajectory capture + batch agentic-eval / security runs (regression suites)~~
+- ~~External-observability ingestion (LangSmith / Langfuse / Phoenix / Braintrust via OpenInference)~~
+- Enterprise plan GA; SSO / SAML & SCIM · SOC 2 Type I · Self-hosted / VPC deployment
+- A/B testing for prompts
 
 **2027 — Data & Analytics**
 - Advanced cost analytics (per-model trend, anomaly detection)
-- Batch evaluation API; experiment tracking (head-to-head prompt versions)
+- Experiment tracking (head-to-head prompt versions)
 - Memory management (`fluiq.remember()` / `fluiq.recall()`) — not yet started
 - Custom dashboard widgets
 

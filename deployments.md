@@ -92,6 +92,46 @@ and rolls the ECS service.
 
 ---
 
+## Infrastructure — messaging, data, scaling
+
+**Kafka (self-hosted EC2, replaces MSK).** MSK was ~87% of the AWS bill, so the
+broker moved to a single-node Kafka (KRaft, Docker) on a `t4g.medium` EC2
+(`172.31.13.149:9092`), private VPC, PLAINTEXT, SG-locked to ECS. Provisioning +
+cutover + topic scripts are in `kafka-ec2/` (`user-data.sh`, `create-topics.sh`,
+`cutover.sh`). Config is centralized in SSM (`/fluiq/prod/KAFKA_*`), so cutover is
+a param overwrite + `force-new-deployment` (no task-def/code change). The MSK
+cluster + configuration are deleted.
+
+**Data stores (single-node EC2 / RDS).** ClickHouse on `t4g.medium` EC2
+(`172.31.1.180:8123`), Postgres on RDS `db.t4g.micro`, Redis on ElastiCache
+`t4g.micro` — all private, SG → ECS only. Chosen tier is elasticity-only (no
+multi-node HA) to stay under the ~$150/mo budget; resilience is EC2 auto-recovery
++ DLM EBS snapshots.
+
+**ECS autoscaling (Application Auto Scaling).** All four services scale on CPU
+(target 65%) but never below 1 (always a warm task — Docker cold-start is too
+slow to scale from 0): `fluiq-api` 1→4, `fluiq-tracer`/`fluiq-evaluator` 1→3,
+`fluiq-security` 1→2, on-demand Fargate. Set up via `autoscale/setup-elasticity.sh`.
+
+**Admin infra logs.** The Admin console tails Kafka (`docker logs` via SSM),
+ClickHouse (`system.text_log`/`query_log`), and Postgres (RDS log API). These need
+the extra IAM in `fluiq-api-infra-admin-policy.json` (ssm:SendCommand /
+GetCommandInvocation, rds:DescribeDBLogFiles / DownloadDBLogFilePortion) on the
+`fluiqECSTaskRole`; endpoints fail soft until it's attached.
+
+**Schema deploy ordering.** `_apply_schema()` runs on API boot (idempotent
+`CREATE/ALTER … IF NOT EXISTS`), so **deploy the API before the workers**. New
+columns/tables must exist before a worker's by-name insert references them:
+`traces.retention_days` / `is_root` / `agent_key` / `agent_kind` (before the
+tracer), the four `*_rollup` tables + MVs, `dataset_trajectory_spans`, and the
+`users.trial_ends_at` / `trial_used` columns (before the API serves trials).
+Dataset trajectory media is offloaded to the private S3 bucket (reuses the blog
+task role). Roll-up tables are seeded from history once with
+`db_queues/clickhouse/rollup_backfill.sql` (TRUNCATE + re-insert to avoid
+double-counting if the MVs already captured recent rows).
+
+---
+
 ## Python SDK → PyPI
 
 `fluiq-sdk/.github/workflows/release.yaml` publishes `fluiq` to PyPI on a semver
@@ -164,7 +204,8 @@ Each worker (`fluiq-workers/{tracer,evaluator,security}`) has its own
 `deploy.yml` mirroring the API flow (build → ECR → render live task def → ECS
 deploy → wait for stability) against its own ECR repo / ECS service. Push to
 `main` deploys all changed workers; use each workflow's `workflow_dispatch` to
-redeploy one. See `docs/workers.md` for env vars and topics.
+redeploy one. See `docs/workers.md` for shared topics/auth, and
+`docs/tracer.md` / `docs/evaluator.md` / `docs/security.md` for per-worker env vars.
 
 ---
 
@@ -179,9 +220,36 @@ so order the rollout:
 2. **Ensure `POSTGRES_DSN` is set on the evaluator ECS task,** then deploy the
    evaluator worker. Warn-mode custom judges resolve `kind='judge'` rows from
    Postgres; without the DSN they are silently skipped (built-in metrics still
-   run). See `docs/workers.md`.
+   run). See `docs/evaluator.md`.
 3. **Ship the SDKs** (Python `custom_judges`, TS `customJudges`) so clients can
    reference judges by slug. Existing SDK builds keep working — the field is
    optional and fail-open.
 4. **Frontend** (Amplify) gains the Prompts → Save-as-**Judge** toggle; deploy
    any time after the API.
+
+---
+
+## <a id="feature-note-agentic-eval"></a>Feature note — Agentic evaluator
+
+Spans the SDK, API, evaluator worker, ClickHouse, Postgres, and frontend. Order:
+
+1. **Deploy the API first.** Startup `_apply_schema()` runs the idempotent
+   `ALTER TABLE fluiq.evaluations ADD COLUMN IF NOT EXISTS layer / step_id /
+   run_score / run_passed`, and it seeds the 3 new judge prompts
+   (`tool_selection_quality`, `trajectory_quality`, `agent_coordination`). The API
+   also exposes `/evaluate/agentic` + `/evaluate/agentic-summary` and the
+   per-LLM-call auto-eval fan-out (`EVAL_AUTO_SAMPLE_RATE`).
+2. **Deploy the evaluator worker** — its by-name `insert_evaluation()` references
+   the new columns, so it must go **after** the API. Optional agentic config:
+   `EVAL_AGENT_DEPTH`, `EVAL_PANEL_MODE`, `EVAL_PANEL_GATE_MARGIN`,
+   `EVAL_PANEL_MEMBERS` (see `docs/evaluator.md`).
+3. **Ship the SDKs** — join-node `parent_ids` emission (LangGraph / CrewAI /
+   Google ADK) + the generic `fluiq.join_parents(...)`. All optional / fail-open,
+   so older builds keep working.
+4. **Frontend** (Amplify) gains the drawer **Run Agentic Eval** button (root
+   traces), the per-layer agentic rendering, and the Overview agentic tile; deploy
+   any time after the API.
+
+Calibration (`python -m jobs.calibration.runner`) and harvesting
+(`python -m jobs.calibration.harvest`) are operator CLIs run in the evaluator
+image — not part of the request path.

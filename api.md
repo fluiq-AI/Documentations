@@ -104,13 +104,16 @@ Primary SDK ingestion endpoint. API key auth.
     "type": "llm", "integration": "OpenAI", "model": "gpt-4o", "status": "complete",
     "tokens": { "prompt": 100, "completion": 50, "total": 150 },
     "prompt_cached_tokens": 20, "cache_hit": false,
+    "_eval": true,
     "_eval_config": { "metrics": ["hallucination"], "judge_model": "claude-haiku-4-5-20251001", "thresholds": {}, "custom_judges": { "refund-policy": 0.9 } },
     "_security_config": { "mode": "block", "guardrail": "default" }
   }
 }
 ```
 
-`trace_id` is auto-generated if omitted. `status:"running"` events stream to SSE but are not persisted. Keys prefixed with `_` (`_eval_config`, `_security_config`, `_cache_hit`) are stripped before storage and drive the eval/security fan-out.
+`trace_id` is auto-generated if omitted. `status:"running"` events stream to SSE but are not persisted. Keys prefixed with `_` (`_eval`, `_eval_config`, `_security_config`, `_cache_hit`) are stripped before storage and drive the eval/security fan-out.
+
+**Evaluation is opt-in.** The API only publishes an eval job when the SDK opted in — `eval_enabled = _eval or (_eval_config is not None)`. A trace ingested by `instrument()` alone (no `fluiq.eval()`) is traced but **not** evaluated; the old ambient auto-eval sample rate is gone. Retrieval/LLM auto-scoring likewise only fires when eval is enabled.
 
 **Response** `200 OK`
 ```json
@@ -121,6 +124,27 @@ Primary SDK ingestion endpoint. API key auth.
 When the org's active guardrail policy has `scan_responses: true`, `/ingest` runs the **response gate** synchronously (round-trips the security worker) and may return `response_blocked: true`.
 
 **Errors** · `401` invalid API key · `402` trace quota exceeded · `413` event exceeds the 10 MB Kafka message ceiling
+
+### POST `/api/v1/ingest/otel`
+
+Ingest **OpenInference / OTLP** spans from an external observability platform, so
+their traces flow through the same pipeline as native SDK traces (ClickHouse
+persist + per-call eval + optional security scan; run the agentic evaluator on
+the root afterwards). API-key auth; trace-quota gated. Each span → a Fluiq event
+(`routes/otel/convert.py`).
+
+Accepts one of: OTLP-JSON (`resourceSpans`), flat `spans` (Phoenix-style), or
+pre-mapped `events` (used by the pull connectors).
+
+**Request** `{ "api_key": "flq_...", "source": "phoenix|langfuse|langsmith|braintrust",
+"resourceSpans": [...] | "spans": [...] | "events": [...],
+"eval_config"?: {...}, "security_config"?: {...} }`
+**Response** `200 OK` `{ "ok": true, "source": "...", "spans_received": N, "events_ingested": M, "root_trace_ids": [...] }`
+
+**Integration paths** — **Phoenix / Langfuse**: point their OTel exporter at this
+endpoint (OTLP push). **LangSmith / Braintrust**: run the pull connectors
+(`python -m connectors.langsmith` / `connectors.braintrust`), which fetch from
+the platform API, map to events, and POST here. **Errors** · `401` · `402` · `422` no convertible spans.
 
 ---
 
@@ -158,6 +182,22 @@ List traces for the org (JWT auth).
 }
 ```
 
+The Traces/Agents tables read per-run headline numbers (cost, quality, security,
+span count) from precomputed roll-up tables keyed by `root_trace_id`, so a root
+row shows the whole run's rolled-up quality **without** expanding it or summing
+children at read time.
+
+---
+
+### POST `/api/v1/traces/rollups`
+
+Batch-fetch the precomputed per-run roll-ups for a set of root trace ids (JWT
+auth). Body: `{ "root_trace_ids": ["uuid", …] }`. Returns, per root, the merged
+`run_cost` / `run_tokens`, `quality_min` / `quality_avg` / `quality_count`,
+`security` (max risk, should-block, detections), and `span_count`. Backed by
+ClickHouse `AggregatingMergeTree` roll-up tables fed incrementally by
+materialized views as children finish; the dashboard calls this once per page.
+
 ---
 
 ### GET `/api/v1/traces/spending`
@@ -192,12 +232,24 @@ Plan tier and quota usage (JWT auth).
 ```
 `null` limit = unlimited.
 
-| Tier | Traces / month | Evaluations / month |
-|------|----------------|---------------------|
-| Free | 50,000 | 1,000 |
-| Team | Unlimited | 10,000 |
-| Growth | Unlimited | 100,000 |
-| Enterprise | Unlimited | Unlimited |
+| Tier | Traces | Retention | Evaluations / month |
+|------|--------|-----------|---------------------|
+| Free | Unlimited | 14 days (rolling) | 1,000 |
+| Team | Unlimited | Forever | 10,000 |
+| Growth | Unlimited | Forever | 100,000 |
+| Enterprise | Unlimited | Forever | Unlimited |
+
+**Observability is free and unlimited on every tier.** There is no trace/span/agent
+cap. The only paid axis is **retention**: Free keeps a rolling 14-day window, paid
+keeps traces forever. Retention is enforced by a per-row ClickHouse TTL — the tracer
+stamps `retention_days` on each row from the org's tier at ingest (see `docs/tracer.md`).
+
+### POST `/api/v1/billing/trial`
+
+Starts a no-card **5-day trial** of a paid tier (Team or Growth) for the org (JWT
+auth). Sets `users.trial_ends_at`; the tier is resolved lazily and auto-expires
+back to Free when the window passes. Body: `{ "tier": "Team" | "Growth" }`. One
+trial per org (`users.trial_used`).
 
 ---
 
@@ -205,7 +257,11 @@ Plan tier and quota usage (JWT auth).
 
 ### GET `/api/v1/agents/summary`
 
-Cost / token / latency rollup grouped by agent (JWT auth). Query: `limit` (default 100, max 1000).
+Cost / token / latency rollup grouped by agent (JWT auth), read from the
+precomputed per-run roll-up tables. Query: `limit` + `offset` (windowed
+pagination — the dashboard pages 50 at a time). The roll-up groups by the
+denormalized `agent_key` / `agent_kind` / `integration`; a LangGraph run appears
+as `LangGraph(node_a, node_b, …)`.
 
 ```json
 { "agents": [{
@@ -368,14 +424,23 @@ SDK read endpoint (API key). Query: `env` (default `production`). Used by `fluiq
 
 ## Datasets
 
+Curated golden sets built from real traces. A trace-backed example pins the run's
+**whole trajectory** (all spans: LLM calls, tool/MCP calls, the multi-agent DAG,
+media) into a no-TTL ClickHouse store (`dataset_trajectory_spans`, media offloaded
+to S3), so agentic eval / security can run over it offline, retention-independent.
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /api/v1/datasets` | List datasets |
-| `POST /api/v1/datasets` | Create `{ name }` |
-| `DELETE /api/v1/datasets/{id}` | Delete |
-| `GET /api/v1/datasets/{id}/examples` | List examples |
-| `POST /api/v1/datasets/{id}/examples` | Add a trace `{ trace_id }` |
+| `POST /api/v1/datasets` | Create `{ name, description? }` |
+| `DELETE /api/v1/datasets/{id}` | Delete (also drops runs, agent links) |
+| `GET /api/v1/datasets/{id}/examples` | List examples — windowed pagination (`limit` ≤200 default 50, `offset`); each row auto-enriched with eval/security/cost by `source_trace_id` |
+| `POST /api/v1/datasets/{id}/examples` | Add `{ input, expected_output?, metadata }`. Pass `metadata.source_trace_id` (the run's **root** trace id) and the server snapshots that run's full trajectory + derives an IO summary. Empty-input trace-backed examples are accepted (e.g. a CrewAI crew root). |
 | `DELETE /api/v1/datasets/{id}/examples/{example_id}` | Remove example |
+| `GET /api/v1/datasets/{id}/examples/{example_id}/trajectory` | The pinned trajectory as a compact, display-ready summary (DFS-ordered steps with type/agent/model/tool-calls/MCP/media + rollup stats) |
+| `POST /api/v1/datasets/{id}/runs` | Launch a batch run `{ kind: "agentic" \| "security", depth? }` over every example |
+| `GET /api/v1/datasets/{id}/runs` · `GET /api/v1/datasets/runs/{run_id}` | List runs · fetch a run's report |
+| `POST /api/v1/datasets/{id}/agents` · `GET`/`DELETE .../agents` | **Connect Agents**: link a traced agent → imports all its runs to date (deduped, full trajectory pinned) and auto-appends future runs |
 
 All JWT-authed.
 
@@ -413,6 +478,23 @@ JWT-authed playground. Publishes a `playground_eval` job to the eval worker and 
 
 ### POST `/api/v1/evaluate/compare`
 JWT-authed. Runs the same prompt against multiple Claude models in parallel (`claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`), returning per-model output, latency, tokens, and estimated cost.
+
+### POST `/api/v1/evaluate/agentic`
+JWT-authed. Triggers **agentic (multi-layer) evaluation** for a whole run — fired by the **Run Agentic Eval** button in the trace drawer (root traces only). Fetches every span sharing the `root_trace_id`, publishes one `agent_eval` job to the eval worker (async), and returns immediately; layered results (deterministic + tool-selection + trajectory [+ panel]) stream back over the SSE `trace.enriched` channel. Quota-gated.
+
+**Request** `{ "trace_id": "uuid", "root_trace_id": "uuid?", "depth": "fast|standard|deep?" }`
+**Response** `200 OK` `{ "ok": true, "trace_id": "uuid", "status": "queued", "events": 7 }` · `status:"skipped"` when eval quota is exceeded. **Errors** · `404` no trace events · `422` invalid id.
+
+### GET `/api/v1/evaluate/agentic-summary?window_hours=24`
+JWT-authed. Aggregates agentic-eval health for the Overview tile over a window (1..720h): run count, run pass-rate, avg run score, and per-layer average scores.
+
+**Response** `200 OK`
+```json
+{ "window_hours": 24, "runs": 42, "pass_rate": 0.83, "avg_run_score": 0.79,
+  "layers": [ { "layer": "deterministic", "score": 0.88, "count": 42 },
+              { "layer": "tool_selection", "score": 0.81, "count": 42 },
+              { "layer": "trajectory", "score": 0.74, "count": 40 } ] }
+```
 
 ---
 
@@ -465,9 +547,9 @@ Admin JWT. Returns HMAC-signed request audit-log entries from ClickHouse `audit_
 ## Admin (`/admin`, `require_admin`)
 
 Internal operator endpoints, gated to `user_type == "Admin"`. Besides platform
-stats, user/org listing, plan changes, blog CMS, and the read-only infra/SQL
-console, the admin surface includes evaluation-allowance and judge-prompt
-management.
+stats, user/org listing, plan changes, blog CMS, and the infrastructure console
+(read-only SQL, worker status/logs, secrets, and scaling), the admin surface
+includes evaluation-allowance and judge-prompt management.
 
 ### Evaluations — per-org allowance
 
@@ -489,7 +571,7 @@ Admins can grant or deduct evaluations on top of an org's tier quota
 
 ### Judge Prompts — LLM-as-Judge templates
 
-Platform-global prompts the evaluator worker renders (see `docs/workers.md`).
+Platform-global prompts the evaluator worker renders (see `docs/evaluator.md`).
 Stored in `eval_judge_prompts`; seeded on API startup. Templates use
 `string.Template` `$var` placeholders; an edit/create is rejected if it drops a
 required placeholder.
@@ -506,6 +588,31 @@ required placeholder.
 
 A custom (admin-created) prompt is stored for the future — it runs only once
 evaluator code references it by name via `render("name", …)`.
+
+### Infrastructure — workers, logs, secrets, scaling
+
+Live AWS operator surface for the API + workers. The four manageable services are
+`fluiq-api`, `fluiq-tracer`, `fluiq-evaluator`, `fluiq-security`. Reads need scoped
+AWS permissions on the API task role; the **mutating** endpoints (✎) additionally
+need `ssm:Put/DeleteParameter`, `ecs:RegisterTaskDefinition` / `UpdateService`, and
+`iam:PassRole` — every mutation emits a structured audit log line
+(`infra-audit admin=… action=… …`). Secret **values are never returned**.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /admin/infra/query` | Read-only SQL (`SELECT/WITH/SHOW/DESCRIBE/EXPLAIN`, single statement) against Postgres or ClickHouse; capped at 1000 rows |
+| `GET /admin/infra/workers` | ECS service status (`running/desired/pending`, task def, rollout) |
+| `GET /admin/infra/workers/{service}/logs` | CloudWatch logs. **No params** → tail the latest stream. Any of `q` (case-sensitive substring), `start`, `end` (epoch ms) → `filter_log_events` across **all** streams, ascending by timestamp. `limit` 1–2000 (default 200; 500 on tail) |
+| `GET /admin/infra/secrets` | List SSM parameter names/metadata under `/fluiq/prod/` (never values) |
+| ✎ `PUT /admin/infra/secrets` | Create/update an SSM parameter `{ name, value, type?, description? }` (`type` `SecureString`\|`String`; name must match `/fluiq/prod/<NAME>`) |
+| ✎ `DELETE /admin/infra/secrets?name=` | Delete an SSM parameter (`404` if not found) |
+| `GET /admin/infra/workers/{service}/secrets` | List the worker's task-def secret bindings (`name` + `value_from` ARN) |
+| ✎ `POST /admin/infra/workers/{service}/secrets` | Wire an SSM param into the worker as an env var `{ env_name, ssm_name, value?, type? }`. With `value` the SSM param is created/updated first. Registers a new task-def revision and updates the service — **redeploys the worker** |
+| ✎ `DELETE /admin/infra/workers/{service}/secrets/{env_name}` | Remove a binding (new revision + redeploy). The SSM parameter itself is left intact |
+| ✎ `POST /admin/infra/workers/{service}/scale` | Set desired task count `{ desired }` (0–10; 0 stops the service). Returns live `{ desired, running, pending }` |
+
+Mutations fail with `502` (`detail` carries the AWS error) when the IAM policy
+is not yet attached; unknown `service` → `404`, out-of-range/invalid input → `400`.
 
 ---
 

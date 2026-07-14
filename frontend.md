@@ -52,8 +52,8 @@ src/
 
 | Route | Screen | Purpose |
 |-------|--------|---------|
-| `/dashboard/overview` | Overview | Usage, quota, spending & cache-hit summary |
-| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection |
+| `/dashboard/overview` | Overview | Usage, quota, spending, cache-hit & agentic-eval summary tiles |
+| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; **Run Agentic Eval** button in the drawer's Evaluation tab (root traces only) |
 | `/dashboard/agents` | Agents | Per-agent cost / token / latency rollup |
 | `/dashboard/security` | Security | Security risk panel; agentic threat verdicts |
 | `/dashboard/guardrails` | Guardrails | Guardrail policy editor |
@@ -83,11 +83,26 @@ Dashboard routes are guarded by auth — an unauthenticated visit redirects to `
 | `/admin/organizations` | Organizations | Org list |
 | `/admin/plans` | Plans | Plan distribution |
 | `/admin/blog` | Blog | Blog CMS (TipTap editor) |
-| `/admin/architecture` · `/admin/infrastructure` | Architecture / Infrastructure | System map; read-only SQL + worker/log console |
+| `/admin/architecture` | Architecture | Live AWS topology (React Flow) — self-hosted Kafka EC2, ECS autoscaling (1→N, CPU 65%), data stores; click a node for details |
+| `/admin/infrastructure` | Infrastructure | Store cards (RDS · ClickHouse · Kafka); **Logs**, **Workers**, **Secrets** tabs |
+| `/admin/sql-editor` | SqlEditor | Full-page read-only SQL editor with a results panel that drops up from the bottom (expand / CSV export) |
+
+The Infrastructure screen (`src/screens/Admin/Infrastructure/`) has **Overview**
+(store cards + a link to the SQL Editor), **Logs** (`LogsTab` → Kafka / ClickHouse
+/ Postgres tail), **Workers** (`WorkersTab` → per-worker detail with **Logs** /
+**Secrets** sub-tabs + a scaling stepper), and **Secrets** (`SecretsTab`) tabs.
+The SQL console is now its own full-page route (`/admin/sql-editor`, `SqlEditor/`)
+rather than a half-height panel. Add/delete actions use a shared typed-name
+confirmation (`ConfirmDelete.tsx`).
 
 Admin calls (via `authFetch`): `GET/POST /admin/users/{id}/evaluations` (eval
-allowance) and `GET/POST/PUT /admin/judge-prompts…` (judge prompts) — see
-`docs/api.md` (Admin).
+allowance), `GET/POST/PUT /admin/judge-prompts…` (judge prompts), and the
+infrastructure endpoints — `POST /admin/infra/query`, `GET /admin/infra/workers`,
+`GET /admin/infra/workers/{svc}/logs` (`q`/`start`/`end`/`limit`),
+`GET /admin/infra/logs/{source}` (`source` = kafka · clickhouse · postgres),
+`GET/PUT/DELETE /admin/infra/secrets`,
+`GET/POST/DELETE /admin/infra/workers/{svc}/secrets`, and
+`POST /admin/infra/workers/{svc}/scale` — see `docs/api.md` (Admin).
 
 ---
 
@@ -186,15 +201,18 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 | Overview | `GET /api/v1/traces/spending` | Spending rollup |
 | Overview | `GET /api/v1/optimize/cache-stats?window_hours=24` | Cache hit rate |
 | Traces | `GET /api/v1/traces?…` | Filtered/paginated trace list |
+| Traces | `POST /api/v1/traces/rollups` | Per-run cost/quality/security/count roll-ups (root rows) |
 | Traces | `GET /api/v1/traces/stream` | Realtime SSE stream |
-| Agents | `GET /api/v1/agents/summary?limit=200` | Agent cost rollup |
-| Security | `GET /api/v1/traces?security=…` | Trace security verdicts |
+| Agents | `GET /api/v1/agents/summary?limit=&offset=` | Agent roll-up (windowed pagination) |
+| Security | `GET /api/v1/traces?security=…&limit=&offset=` | Trace security verdicts (paginated) |
 | Guardrails | `GET /api/v1/guardrails` · `GET /api/v1/guardrails/list` | Read policy / slugs |
 | Guardrails | `PUT /api/v1/guardrails?slug=` · `DELETE /api/v1/guardrails?slug=` | Save / delete |
 | Alerts | `GET /api/v1/alerts` · `PUT /api/v1/alerts` · `POST /api/v1/alerts/test` | Slack alert config |
 | Optimize | `GET /api/v1/optimize/cache-stats` · `GET /api/v1/optimize/prompt-cache-stats` | Cache stats |
 | Tests | `GET /api/v1/traces` (filtered) · `POST /api/v1/evaluate/playground` | Eval scores / playground |
-| Tests / Datasets | `GET/POST /api/v1/datasets`, `…/examples` | Dataset management |
+| Datasets | `GET/POST /api/v1/datasets`, `…/examples?limit=&offset=` | Dataset + example management (paginated) |
+| Datasets | `GET …/examples/{id}/trajectory` | Pinned trajectory viewer (steps · agents · tools · MCP · media) |
+| Datasets | `POST …/{id}/runs`, `GET …/runs/{id}`, `POST …/{id}/agents` | Batch eval/security runs · Connect Agents |
 | Prompts | `GET/POST /api/v1/prompts`, `PATCH/DELETE …/{id}` | Template CRUD |
 | Prompts | `POST …/{id}/environments/{env}` · `GET …/{id}/versions` · `POST …/versions/{v}/restore` | Env deploy / versions |
 | Prompts | `POST /api/v1/evaluate/compare` | Compare models in playground |
@@ -202,6 +220,20 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 | ApiManagement | `GET/POST /api-keys`, `DELETE /api-keys/{key_id}` | Key management |
 
 Public/marketing calls: `GET /api/v1/models` (cost calculator), `GET /api/v1/blog/*` (blog), `POST /api/v1/contact`, `POST /api/v1/models/request|report`.
+
+**Pagination.** Dashboard lists use **windowed Previous/Next** pagination, not
+infinite "Load more" append — one page in memory at a time, the list is replaced
+per page. A shared `components/Pagination.tsx` (with a `compact` variant for
+sidebars) renders the control; each screen keeps `page` + `reloadKey` state and a
+fetch effect on `offset = page * PAGE_SIZE`. Applies to Agents, Tests, Prompts,
+Audit, Security, and the Datasets examples list. On the SSE-backed Security list,
+live prepend/refresh is gated to page 0 so paging through history isn't disrupted.
+
+**Per-run roll-ups.** The Traces/Agents tables render a root row's headline cost /
+quality / security / span-count from `POST /traces/rollups` (fetched once per
+page), so a root shows rolled-up numbers — e.g. a run whose evals live on child
+spans still shows its quality — without expanding it. Falls back to client-side
+child summation only when a rollup row is absent.
 
 ---
 
@@ -239,8 +271,16 @@ interface QuotaResponse { tier: UserType; traces: QuotaCounter; evaluations: Quo
 
 interface EvaluationScore {
   metric: string; score: number | null
-  evaluator: string; judge_model: string
-  details?: { reason?: string; per_chunk?: { id: string; score: number; useful: boolean }[] }
+  evaluator: string; judge_model: string   // evaluator "fluiq.agent_eval" = agentic
+  details?: {
+    reason?: string; per_chunk?: { id: string; score: number; useful: boolean }[]
+    // Agentic (fluiq.agent_eval) detail blocks, rendered inline in the drawer:
+    per_call?: { tool: string; appropriate: boolean; reason: string }[]      // L2 tool selection
+    deterministic?: { score: number; passed: boolean; findings: { code: string; severity: string; message: string; tool?: string }[] } // L1
+    subgoals?: { subgoal: string; achieved: boolean }[]; goal_completion?: number; efficiency?: number // L3 trajectory
+    panel?: { convened: boolean; agreement?: number; votes_pass?: number; votes_total?: number; members?: { role: string; provider: string; model: string; score: number }[] } // L4
+    run_score?: number; run_passed?: boolean
+  }
 }
 
 interface TraceRecord {

@@ -54,9 +54,10 @@ All routers are mounted in `main.py`. Dashboard routers use JWT (`get_current_se
 | Router | Prefix | Auth | Description |
 |--------|--------|------|-------------|
 | `trace.router` | `/api/v1` | API key / JWT | `/ingest` (SDK), `/traces`, `/traces/stream`, `/traces/spending` |
+| `otel_router` | `/api/v1` | API key | `/ingest/otel` — import OpenInference/OTLP spans from Phoenix/Langfuse (push) or the LangSmith/Braintrust pull connectors (`connectors/`) |
 | `agents_router` | `/api/v1` | JWT | `/agents/summary` |
 | `quota_router` | `/api/v1` | JWT | `/quota` |
-| `evaluate_router` | `/api/v1` | JWT / API key | `/evaluate` |
+| `evaluate_router` | `/api/v1` | JWT / API key | `/evaluate`, `/evaluate/agentic` (Run Agentic Eval — root traces), `/evaluate/agentic-summary`, `/evaluate/playground`, `/evaluate/compare` |
 | `optimize_router` | `/api/v1/optimize` | JWT or API key (per endpoint) | Cache stats, profile, Redis proxy, CI eval gate |
 | `secure_router` | `/api/v1` | API key | `/secure/check` (pre-call guard) |
 | `guardrails_router` | `/api/v1` | JWT | `/guardrails` CRUD + `/guardrails/list` |
@@ -99,7 +100,7 @@ Async pool (`asyncpg`), now hosted on **AWS RDS** (migrated off the old managed 
 - `guardrail_policies` — per-org guardrail policies (see below)
 - `alert_settings` — per-org Slack alert configuration
 - Prompt templates + version history; datasets + examples
-- `eval_judge_prompts` + `eval_judge_prompt_versions` — platform-global LLM-as-Judge prompts (admin-editable, seeded on startup) read by the evaluator worker; see `docs/workers.md`
+- `eval_judge_prompts` + `eval_judge_prompt_versions` — platform-global LLM-as-Judge prompts (admin-editable, seeded on startup) read by the evaluator worker; see `docs/evaluator.md`
 - `model_prices` — model cost table (read by the tracer worker for cost estimation; surfaced via `/models`)
 - Blog posts (admin CMS) — body + media object keys
 
@@ -108,13 +109,17 @@ Helper modules include `auth.py` (`resolve_api_key`, `get_org_tier`, `get_org_ev
 ### ClickHouse — `db_queues/clickhouse/`
 
 Async client (`clickhouse-connect`), **self-hosted on AWS EC2** (cut over from ClickHouse Cloud). Read queries live in `ClickHouseQueryMixin`. Tables:
-- `traces` — all SDK events (JSON `event` column)
+- `traces` — all SDK events (JSON `event` column) + denormalized `is_root`, `agent_key`, `agent_kind`, and `retention_days` (per-row TTL `ingested_at + toIntervalDay(retention_days)` — the free-obs / paid-retention mechanism)
 - `trace_costs` — per-trace cost breakdowns
-- `evaluations` — LLM-judge scores per trace
+- `evaluations` — LLM-judge scores per trace; agentic rows (`evaluator='fluiq.agent_eval'`) also carry `layer` / `run_score` / `run_passed` columns
 - `security` — agentic security scan results (written by the security worker)
+- `trace_cost_rollup` / `trace_quality_rollup` / `trace_security_rollup` / `trace_count_rollup` — `AggregatingMergeTree` per-run roll-ups keyed by `root_trace_id`, fed incrementally by materialized views on insert (cost/count from `traces`/`trace_costs`, quality/security from `evaluations`/`security`). Read with the `-Merge` combinators. `rollup_backfill.sql` seeds history once (MVs only capture rows inserted after they exist).
+- `dataset_trajectory_spans` — `ReplacingMergeTree`, **no TTL**: the pinned whole-trajectory snapshot behind trace-backed dataset examples (one row per span, keyed by `org_id, root_trace_id, trace_id`); media offloaded to S3
 - `audit_log` — HMAC-signed request audit trail
 
-Key query methods: `fetch_traces()` (paginated, joins evals + security + costs), `count_traces()` / `count_evaluations()` (quota), `fetch_cache_stats()`, `fetch_prompt_cache_stats()`, `fetch_optimization_profile()`, `fetch_agent_summary()`, `fetch_recent_evals()`, plus spending rollups.
+Key query methods: `fetch_traces()` (paginated, joins evals + security + costs), `get_root_rollups()` (batch per-run roll-ups for `/traces/rollups`), `count_traces()` / `count_evaluations()` (quota), `fetch_cache_stats()`, `fetch_prompt_cache_stats()`, `fetch_optimization_profile()`, `fetch_agent_summary()` (reads the roll-ups + denormalized `agent_key`), `get_dataset_trajectory()` / `insert_dataset_trajectory()`, `fetch_recent_evals()`, `fetch_agentic_summary()` (Overview agentic tile — per-layer pass-rate/score), plus spending rollups. The evaluator worker's own CH client adds `fetch_recent_trace_events()` for calibration harvesting.
+
+**Schema application:** `_apply_schema()` runs `db_queues/clickhouse/schema.sql` on API startup — idempotent `CREATE … IF NOT EXISTS` / `ALTER … ADD COLUMN IF NOT EXISTS` (this is how the agentic `evaluations` columns land). Deploy the **API before the evaluator worker** so the columns exist before the worker's by-name inserts reference them.
 
 ### Redis — used by `routes/optimize/` and `db_queues/kafka/`
 
@@ -129,7 +134,9 @@ Key query methods: `fetch_traces()` (paginated, joins evals + security + costs),
 
 ### Auth — `kafka_auth_kwargs()`
 
-Shared by the producer and all consumers. `KAFKA_SECURITY_PROTOCOL=PLAINTEXT` (local docker) → no auth; `SASL_SSL` → SCRAM-SHA-512 username/password over TLS for **AWS MSK** (broker certs chain to Amazon Trust Services, so no CA file is needed). The identical helper exists in each worker's `config.py`.
+Shared by the producer and all consumers. `KAFKA_SECURITY_PROTOCOL=PLAINTEXT` → no auth; `SASL_SSL` → SCRAM-SHA-512 username/password over TLS. The identical helper exists in each worker's `config.py`.
+
+**Prod broker: self-hosted Kafka on EC2 (KRaft, Docker).** Kafka originally ran on AWS MSK, but MSK was ~87% of the AWS bill, so it was migrated to a single-node Kafka on a `t4g.medium` EC2 (`172.31.13.149:9092`) — private VPC, locked to the ECS security group, so prod runs **PLAINTEXT** (no SASL/TLS needed in-VPC; matches the ClickHouse EC2 posture). Provisioning + cutover artifacts live in `kafka-ec2/`. The old MSK `SASL_SSL` path is retained in the helper for parity but is unused in prod.
 
 ### Producer
 
@@ -163,10 +170,10 @@ Shared by the producer and all consumers. `KAFKA_SECURITY_PROTOCOL=PLAINTEXT` (l
 
 1. **Resolve API key** → 401 on failure.
 2. **Quota check** — trace quota enforced before any Kafka work → 402 on over-cap.
-3. **Strip internal SDK flags** — `_eval_config`, `_security_config` (and `_`-prefixed cache flags) extracted and removed from the stored event.
+3. **Strip internal SDK flags** — `_eval`, `_eval_config`, `_security_config` (and `_`-prefixed cache flags) extracted and removed from the stored event.
 4. **Response gate** (synchronous, only when the org's policy has `scan_responses=True` and the event is an LLM response): publishes a `response_gate_check` job to `KAFKA_SECURITY_TOPIC`, awaits the reply, and stamps the gate decision into the event before persistence.
-5. **Kafka publish** — event published to `KAFKA_TRACE_TOPIC` (returns 413 on `MessageSizeTooLargeError`).
-6. **Eval fan-out** — if `_eval_config` present, LLM trace, and eval quota not over: retrieval traces → `KAFKA_EVAL_TOPIC` (`auto`); LLM eval configs → `sdk_llm` job.
+5. **Kafka publish** — event published to `KAFKA_TRACE_TOPIC` (returns 413 on `MessageSizeTooLargeError`). The tracer stamps `is_root` / `agent_key` / `agent_kind` and the tier `retention_days` on the persisted row.
+6. **Eval fan-out is opt-in** (eval quota permitting). `eval_enabled = _eval or (_eval_config is not None)` — i.e. the caller must have opted in via `fluiq.eval()`. Only then does a retrieval trace publish an `auto` job and an LLM trace publish an `sdk_llm` job (using the caller's `_eval_config` metrics/thresholds). With no opt-in, the trace is stored but **never** evaluated — the old ambient `EVAL_AUTO_SAMPLE_RATE` default has been removed. Agentic evaluation is separate and explicit — the **Run Agentic Eval** button (`POST /evaluate/agentic`) fetches the whole trace tree and publishes one `agent_eval` job; a Dataset batch run does the same over pinned trajectories.
 7. **Security fan-out** — if `_security_config` present: publishes `sdk_security` (`auto_security_scan`) to `KAFKA_SECURITY_TOPIC`, forwarding the org's `pii_ignore` and `allowed_tools` so the worker can apply policy.
 
 The expanded `GET /api/v1/traces` accepts `key_id`, `agent_key`, `agent_kind`, `root_trace_id`, `roots_only`, `limit`, `offset`, `sort`, `status`, `security`, `integration`, and `quality` filters. `GET /api/v1/traces/spending` returns cost rollups.
@@ -189,7 +196,7 @@ Gated to `{"Growth", "Enterprise"}` tiers (402 otherwise). Flow:
 
 ### Post-call scan & response gate
 
-Run in the **security worker** (`auto_security_scan`, `response_gate_check`). Results land in the ClickHouse `security` table and fan out to SSE. See `docs/workers.md`.
+Run in the **security worker** (`auto_security_scan`, `response_gate_check`). Results land in the ClickHouse `security` table and fan out to SSE. See `docs/security.md`.
 
 ---
 
@@ -238,7 +245,7 @@ Per-org Slack alerting stored in `alert_settings`. `GET/PUT /alerts` configure i
 
 CRUD + versioned templates. Every update creates a new version; previous versions are preserved and restorable. Prompts are promoted into named **environments** (`development`/`staging`/`production`) independently via `/environments/{env}`; `/deploy` is the legacy `{deploy: bool}` toggle. `GET /prompts/fetch/{slug}?env=` is the SDK read path used by `fluiq.fetch_prompt()`.
 
-Each prompt has a `kind` — `'completion'` (default) or `'judge'`. A **judge** prompt is a client-authored LLM-as-judge template (placeholders `$question`/`$answer`/`$context`, returns `{"score","reason"}`) that the customer references by slug from `fluiq.eval(custom_judges={slug: threshold})`. The block-mode `/evaluate` path resolves it via `get_custom_judge_template(org_id, slug)`; the evaluator worker resolves it for warn mode. See `docs/workers.md` and `docs/sdk.md`.
+Each prompt has a `kind` — `'completion'` (default) or `'judge'`. A **judge** prompt is a client-authored LLM-as-judge template (placeholders `$question`/`$answer`/`$context`, returns `{"score","reason"}`) that the customer references by slug from `fluiq.eval(custom_judges={slug: threshold})`. The block-mode `/evaluate` path resolves it via `get_custom_judge_template(org_id, slug)`; the evaluator worker resolves it for warn mode. See `docs/evaluator.md` and `docs/sdk.md`.
 
 ---
 
@@ -264,14 +271,24 @@ In-house admin CMS (TipTap editor on the frontend). Public endpoints serve posts
 
 ## Tiers & Quotas — `shared/quotas.py`
 
-Four tiers. `(trace_quota, eval_quota)` per calendar month; `-1` = unlimited. Counts come from ClickHouse filtered on org + current month, with a 60 s in-process TTL cache and optimistic bumping on the hot `/ingest` path.
+Four tiers. **Observability (traces) is free and unlimited on every tier** — the
+paid axis is trace **retention**, enforced by a per-row ClickHouse TTL from
+`retention_days` (Free = 14, paid = 36500). `eval_quota` is metered per calendar
+month; `-1` = unlimited. Counts come from ClickHouse filtered on org + current
+month, with a 60 s in-process TTL cache and optimistic bumping on the hot
+`/ingest` path. `TIER_RETENTION_DAYS` / `retention_days_for_tier()` drive the
+tracer's per-row TTL stamp.
 
-| Tier | Traces / month | Evaluations / month |
-|------|----------------|---------------------|
-| Free | 50,000 | 1,000 |
-| Team | Unlimited | 10,000 |
-| Growth | Unlimited | 100,000 |
-| Enterprise | Unlimited | Unlimited |
+| Tier | Traces | Retention | Evaluations / month |
+|------|--------|-----------|---------------------|
+| Free | Unlimited | 14 days | 1,000 |
+| Team | Unlimited | Forever | 10,000 |
+| Growth | Unlimited | Forever | 100,000 |
+| Enterprise | Unlimited | Forever | Unlimited |
+
+**Self-serve trial.** `POST /billing/trial` starts a no-card **5-day trial** of
+Team or Growth (`users.trial_ends_at` / `trial_used`); `get_org_tier()` resolves
+the trial tier lazily and auto-expires it back to Free when the window passes.
 
 Admins can adjust a single org's eval allowance via `organizations.eval_quota_bonus`
 (Admin → Evaluations): `get_quota_status()` adds it to the tier eval quota

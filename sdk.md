@@ -180,7 +180,20 @@ class TraceType(str, Enum):
     General_Function = "OTHERFUNCTION"
 ```
 
-Core `LogTrace` fields: `trace_id, parent_id, function, integration, type, timestamp, started_at, latency, model, input, output, messages/contents, response, system, tools, tool_calls/tool_uses, mcp_servers/mcp_calls/mcp_results, tokens, thinking, success, status, finish_reasons, stop_reason, error_traceback` — plus any extras.
+Core `LogTrace` fields: `trace_id, parent_id, parent_ids, function, integration, type, timestamp, started_at, latency, model, input, output, messages/contents, response, system, tools, tool_calls/tool_uses, mcp_servers/mcp_calls/mcp_results, tokens, thinking, success, status, finish_reasons, stop_reason, error_traceback` — plus any extras.
+
+`parent_ids` (optional list) carries the **multiple parents of a DAG join / fan-in node**, emitted **only on real joins** (≥2 parents) so single-parent nodes keep just `parent_id`. Four sources:
+
+- **LangGraph** — modern LangGraph names a node's `langgraph_triggers` after the *destination* channel (e.g. `branch:to:synthesize`), not the source nodes, so trigger parsing alone can't see a fan-in. The integration instead captures the graph's declared edges at `StateGraph.compile()` and resolves a join node's parents from its static predecessors intersected with the nodes that actually ran this graph invocation — reliable regardless of the trigger encoding.
+- **CrewAI** — a Task with ≥2 dependency tasks (`task.context`) is a join; the integration maps each dependency task to its execution run_id.
+- **Google ADK** — an agent whose `instruction` reads ≥2 upstream `{state_key}` outputs (each written by an agent's `output_key`, e.g. the children of a `ParallelAgent`) is a join; the plugin maps each referenced key to the writer agent's run_id.
+- **Generic / A2A / custom** — wrap the aggregating call in `with fluiq.join_parents(id_a, id_b): ...` (accepts varargs or a list). The next `@fluiq.trace` call emits those as its `parent_ids`. This is the seam for agent-to-agent frameworks that have no built-in integration.
+
+**Full-DAG rendering — `predecessors`.** `parent_ids` only carries fan-*in* joins, so single-predecessor fan-*out* edges would be invisible. The integrations therefore also stamp a node's complete predecessor set: LangGraph writes node **names** to `event.langgraph.predecessors` (from the same static edge graph), while CrewAI and Google ADK write predecessor **run_ids** to a top-level `event.predecessors`. The dashboard draws the real DAG (fan-out, joins, loop-backs) from these; the evaluator uses `parent_ids` for its coordination metric. See `docs/evaluator.md`.
+
+**Agent identity.** A run surfaces in the Agents view by a stable key: `function`/`name` for `@trace` and plain chains, the `langgraph_node` for a node, or — for a whole graph run whose container span is otherwise anonymous — `LangGraph(node_a, node_b, …)` (named from the compiled graph's nodes, mirroring CrewAI's `Crew(agent_1, …)`). The tracer denormalizes this onto each root at ingest so the Agents roll-up needs no read-time scan.
+
+**Multimodal — media references.** The SDK never stores raw image/audio/video/document payloads (large, sensitive, over the Kafka ceiling), but it no longer *drops* them either. `_strip_media` (OpenAI / Anthropic / Gemini, via `integrations/shared/media.py:media_reference`) replaces each media content part with a payload-free `_media_ref` — `{kind, mime, source (url|base64|file), bytes, sha256}`. Text parts are kept verbatim; Anthropic `thinking`/`redacted_thinking` blocks are still dropped (captured separately). So a vision/audio call is traced as its text plus a compact reference, making the *presence* of media visible to the evaluator and security scanners (which remain text-only for now).
 
 ---
 
