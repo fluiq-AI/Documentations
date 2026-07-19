@@ -85,6 +85,49 @@ In `warn` mode the eval runs entirely server-side (Kafka → evaluator worker). 
 
 **Custom judges.** A client can save its own LLM-as-judge prompt on the Prompts page (type **Judge**, `prompts.kind = 'judge'`). The template uses `string.Template` `$question` / `$answer` / `$context` placeholders and should return `{"score": float 0-1, "reason": str}` (a JSON output contract is appended automatically if absent). Reference it by slug with a threshold: `custom_judges={"refund-policy": 0.9}`. Custom judges are embedded in the warn-mode `_eval_config` and sent in the block-mode `/evaluate` body alongside the built-in metrics; scores land in the dashboard under the slug as the metric. A slug that doesn't resolve to a saved judge is silently skipped (fail-open).
 
+### `fluiq.feedback(value, trace_id=None, name="user_feedback", comment=None)`
+
+Record end-user feedback for a trace — call it when your user reacts to an AI
+response.
+
+| Parameter | Notes |
+|-----------|-------|
+| `value` | `True`/`False` for thumbs up/down, or a `0..1` rating |
+| `trace_id` | defaults to the most recent LLM call's trace in the current context (`current_llm_trace_id()`, falling back to the current span) |
+| `name` | feedback channel shown in the dashboard, e.g. `"thumbs"`, `"csat"` |
+| `comment` | free-text from the user |
+
+Fire-and-forget `POST /api/v1/feedback` (Bearer API key): never raises, network
+failures only log locally. Stored in the ClickHouse `evaluations` table as
+`evaluator='human.feedback'` and rendered in the trace drawer next to the judge
+scores; excluded from the automated quality rollup.
+
+### `python -m fluiq.ci` — CI quality gate (`src/fluiq/ci.py`)
+
+Runs a dataset eval as a build gate: launches a batch run over every example,
+polls the report, prints per-metric averages, and exits non-zero on failure
+(GitHub Actions `::error` annotations included).
+
+```bash
+python -m fluiq.ci --dataset "checkout-agent" --kind metrics \
+    --metrics hallucination,relevance,completeness \
+    --fail-below 0.7 --min-example 0.5
+# env: FLUIQ_API_KEY (or --api-key), FLUIQ_API_ENDPOINT (optional)
+```
+
+| Flag | Notes |
+|------|-------|
+| `--dataset` | dataset name (case-insensitive) or UUID |
+| `--kind` | `metrics` (grades answers vs expected outputs) or `agentic` |
+| `--metrics` | comma list for `--kind metrics` (default `hallucination,relevance`) |
+| `--depth` | `fast/standard/deep` for `--kind agentic` |
+| `--fail-below` | fail when the run's average score is below this (default `0.7`) |
+| `--min-example` | also fail when ANY example's average is below this |
+| `--timeout` / `--poll` | polling budget (default 600s / 10s) |
+
+Exit codes: `0` pass · `1` threshold failed · `2` error/timeout. Backed by the
+API-key routes `POST/GET /api/v1/ci/eval-runs[/{run_id}]`.
+
 ### `fluiq.secure(mode="warn", *, guardrail="default")` *(Growth plan+)*
 
 Server-side security scanning against the named guardrail policy.

@@ -40,7 +40,8 @@ src/
 │   └── dashboard/            # authenticated app (see below)
 ├── screens/                  # presentational components rendered by routes
 │   ├── Dashboard/{Agents,Alerts,ApiManagement,Audit,Datasets,GettingStarted,
-│   │              Guardrails,Optimize,Overview,Profile,Prompts,Security,Tests,Traces}
+│   │              Guardrails,Insights,JudgePrompts,Optimize,Overview,Profile,
+│   │              Prompts,Security,Tests,Traces,UserManagement}
 │   ├── Home/ Pricing/ Comparisons/ Platform/ Tools/ Documentation/
 │   ├── Integrations/ Blog/ Authentication/ Legal/ Admin/
 ├── components/ contexts/ lib/ store/ styles/ assets/
@@ -53,7 +54,7 @@ src/
 | Route | Screen | Purpose |
 |-------|--------|---------|
 | `/dashboard/overview` | Overview | Usage, quota, spending, cache-hit & agentic-eval summary tiles |
-| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; **Run Agentic Eval** button in the drawer's Evaluation tab (root traces only) |
+| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; **Run Agentic Eval** button in the drawer's Evaluation tab (root traces only); **AnnotateBar** (thumbs + note → `POST /traces/{id}/annotations`); human feedback/annotation rows render with end-user/team badges; per-score **Judge prompts** block shows the exact rendered prompt + version/source behind every eval |
 | `/dashboard/agents` | Agents | Per-agent cost / token / latency rollup |
 | `/dashboard/security` | Security | Security risk panel; agentic threat verdicts |
 | `/dashboard/guardrails` | Guardrails | Guardrail policy editor |
@@ -61,7 +62,8 @@ src/
 | `/dashboard/optimize` | Optimize | Redis cache stats; MCP cache; Prompt Caching card |
 | `/dashboard/tests` | Tests | Eval scores, CI gate status, dataset management, playground |
 | `/dashboard/prompts` | Prompts | Template editor, version history, env deployments, playground; Save form has a **Completion / Judge** type toggle — Judge prompts (`kind='judge'`) are client-authored LLM-as-judges referenced by slug in `fluiq.eval(custom_judges=…)` |
-| `/dashboard/datasets` | Datasets | Named trace collections for regression testing |
+| `/dashboard/datasets` | Datasets | Named trace collections for regression testing; batch runs (**agentic / security / metrics** — metric picker chips), per-run report, and a **Compare vs…** selector producing a run-vs-run regression view (per-metric deltas, regressed examples) |
+| `/dashboard/judge-prompts` | JudgePrompts | Org-editable LLM-as-judge prompts (effective template vs platform, required-var chips, save/reset-to-platform, org version history + restore) — backed by `/api/v1/eval/judge-prompts` |
 | `/dashboard/api-management` | ApiManagement | API key management |
 | `/dashboard/audit` | Audit | Request audit log |
 | `/dashboard/getting-started` | GettingStarted | Onboarding / install guide |
@@ -212,7 +214,10 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 | Tests | `GET /api/v1/traces` (filtered) · `POST /api/v1/evaluate/playground` | Eval scores / playground |
 | Datasets | `GET/POST /api/v1/datasets`, `…/examples?limit=&offset=` | Dataset + example management (paginated) |
 | Datasets | `GET …/examples/{id}/trajectory` | Pinned trajectory viewer (steps · agents · tools · MCP · media) |
-| Datasets | `POST …/{id}/runs`, `GET …/runs/{id}`, `POST …/{id}/agents` | Batch eval/security runs · Connect Agents |
+| Datasets | `POST …/{id}/runs`, `GET …/runs/{id}`, `POST …/{id}/agents` | Batch agentic/security/metrics runs · Connect Agents |
+| Datasets | `GET …/runs/{id}/compare?against=` | Run-vs-run regression comparison |
+| JudgePrompts | `GET/PUT /api/v1/eval/judge-prompts[/{name}]`, `POST …/reset`, `GET …/versions`, `POST …/restore/{v}` | Org judge-prompt overrides |
+| Traces | `POST /api/v1/traces/{id}/annotations` | AnnotateBar (team thumbs + note) |
 | Prompts | `GET/POST /api/v1/prompts`, `PATCH/DELETE …/{id}` | Template CRUD |
 | Prompts | `POST …/{id}/environments/{env}` · `GET …/{id}/versions` · `POST …/versions/{v}/restore` | Env deploy / versions |
 | Prompts | `POST /api/v1/evaluate/compare` | Compare models in playground |

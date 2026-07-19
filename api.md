@@ -438,11 +438,13 @@ to S3), so agentic eval / security can run over it offline, retention-independen
 | `POST /api/v1/datasets/{id}/examples` | Add `{ input, expected_output?, metadata }`. Pass `metadata.source_trace_id` (the run's **root** trace id) and the server snapshots that run's full trajectory + derives an IO summary. Empty-input trace-backed examples are accepted (e.g. a CrewAI crew root). |
 | `DELETE /api/v1/datasets/{id}/examples/{example_id}` | Remove example |
 | `GET /api/v1/datasets/{id}/examples/{example_id}/trajectory` | The pinned trajectory as a compact, display-ready summary (DFS-ordered steps with type/agent/model/tool-calls/MCP/media + rollup stats) |
-| `POST /api/v1/datasets/{id}/runs` | Launch a batch run `{ kind: "agentic" \| "security", depth? }` over every example |
-| `GET /api/v1/datasets/{id}/runs` · `GET /api/v1/datasets/runs/{run_id}` | List runs · fetch a run's report |
+| `POST /api/v1/datasets/{id}/runs` | Launch a batch run `{ kind: "agentic" \| "security" \| "metrics", depth?, metrics?, custom_judges? }` over every example. `kind:"metrics"` grades each example's recorded answer against its `expected_output` with the chosen metrics (fresh trace ids per run for clean attribution; `metadata.output` is used as the answer when present) |
+| `GET /api/v1/datasets/{id}/runs` · `GET /api/v1/datasets/runs/{run_id}` | List runs · fetch a run's report (per-metric averages + per-item scores for `metrics` runs) |
+| `GET /api/v1/datasets/runs/{run_id}/compare?against={run_id}` | **Run-vs-run regression report** (agentic + metrics kinds): per-metric deltas over examples present in both runs, and per-example `regressed / improved / unchanged` (ε = 0.05), joined by `example_id` |
 | `POST /api/v1/datasets/{id}/agents` · `GET`/`DELETE .../agents` | **Connect Agents**: link a traced agent → imports all its runs to date (deduped, full trajectory pinned) and auto-appends future runs |
+| `POST /api/v1/ci/eval-runs` · `GET /api/v1/ci/eval-runs/{run_id}` | **CI variants** of launch + report — **API-key** auth (Bearer), `dataset_id` or case-insensitive `dataset_name`. Backing for `python -m fluiq.ci` |
 
-All JWT-authed.
+All JWT-authed except the `/ci/eval-runs` pair (API key).
 
 ---
 
@@ -495,6 +497,32 @@ JWT-authed. Aggregates agentic-eval health for the Overview tile over a window (
               { "layer": "tool_selection", "score": 0.81, "count": 42 },
               { "layer": "trajectory", "score": 0.74, "count": 40 } ] }
 ```
+
+### Judge Prompts (org-editable) — `/api/v1/eval/judge-prompts`
+
+JWT-authed. A customer's view of the LLM-as-judge prompt templates their
+evaluations use, with per-org overrides. Resolution in the evaluator worker is
+**org override → platform template → code default**; every eval score records
+which one produced it (`details.judge_prompts`).
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/eval/judge-prompts` | All prompts with this org's override state (`template` = effective, `platform_template` = what reset reverts to, `is_overridden`, `version`) |
+| `PUT /api/v1/eval/judge-prompts/{name}` | Save an org override `{ template }` — `400` if a required `$var` placeholder is dropped |
+| `POST /api/v1/eval/judge-prompts/{name}/reset` | Delete the override → revert to the platform prompt (history kept) |
+| `GET .../versions` · `POST .../restore/{version}` | Org version history · restore a version |
+
+### Feedback & Annotations
+
+Human signals, stored in the ClickHouse `evaluations` table
+(`evaluator = 'human.feedback' | 'human.annotation'`) so they render next to
+judge scores in the trace drawer — but excluded from the automated quality
+rollup.
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/v1/feedback` | **API-key** auth. End-user feedback `{ trace_id, value: bool \| 0..1, name?: "thumbs", comment?, root_trace_id? }`. Backing for `fluiq.feedback()`. `202` |
+| `POST /api/v1/traces/{trace_id}/annotations` | JWT-authed. Team verdict `{ value, metric?, comment?, root_trace_id? }` — e.g. agree/disagree with a judge score (`metric` targets it). `201` |
 
 ---
 

@@ -64,11 +64,24 @@ Every metric that needs a model uses `LLMJudge` (`jobs/helper/judge.py`):
 - **Response cache:** `PromptCache` + `InMemoryCache` — an LRU keyed by
   `sha256(model + prompt + params)`. Identical judge prompts (very common across
   similar traces) are served from cache. This is the main cost lever.
-- **Admin-editable prompts:** all judge prompts live in a registry
-  (`jobs/helper/judge_prompts.py`). Defaults are seeded into Postgres
-  (`eval_judge_prompts`) and can be edited from **Admin → Judge Prompts** without
-  a redeploy. Everything **fails open**: a missing/broken override falls back to
-  the built-in default, so evaluations never break because of this table.
+- **Editable prompts, three levels:** all judge prompts live in a registry
+  (`jobs/helper/judge_prompts.py`). Resolution order per prompt is
+  **org override → platform template → code default**. Platform templates are
+  seeded into Postgres (`eval_judge_prompts`) and edited from
+  **Admin → Judge Prompts**; per-org overrides live in
+  `eval_judge_prompt_org_overrides` and are edited by customers at
+  **Dashboard → Judge Prompts** (`/dashboard/judge-prompts`). The org whose
+  overrides apply is selected per message via `judge_prompts.set_org()` in
+  `app.dispatch()` (safe as a module global — the consumer is strictly serial).
+  Everything **fails open**: a missing/broken override (or an override that
+  drops a required `$var`) falls back to the next level, so evaluations never
+  break because of these tables.
+- **Prompt provenance:** every `render()` inside an evaluator call is captured
+  (`judge_prompts.captured_call(...)` wraps each metric) and attached to the
+  result as `details.judge_prompts = [{name, source: org|platform|default|custom,
+  version, calls, rendered ≤6000 chars}]`. The dashboard renders this in the
+  trace drawer ("Judge prompts" section), so every score shows the exact prompt
+  that produced it.
 
 Each evaluator subclasses `BaseEvaluator` and returns an `EvalResult`
 (`{name, score in [0,1], passed, reason, details}`). `passed = score >= threshold`.
@@ -89,11 +102,20 @@ These score a single `(question, answer, [context])` triple. Used by
 | **Context Recall** (RAGAS) | `ragas.py` | Which reference statements are covered by the context. |
 | **Toxicity** | `ragas.py` | Detects toxic/unsafe content; reported as a safety score. |
 | **Coherence** | `ragas.py` | Logical structure / readability. |
+| **Completeness** | `ragas.py` | Does the answer address every part of the question; returns the `missing` parts. |
 | **Custom judges** | `custom_judge.py` | Customer-authored judge prompt referenced by slug in `fluiq.eval(custom_judges=...)`. |
 
 **`fluiq.eval()` path (`auto_llm_eval`):** pulls `metrics` + `thresholds` from
 the SDK's `eval_config`, extracts the latest user message + the answer, and runs
-each metric as a single-shot judge. One ClickHouse row per metric.
+each metric as a single-shot judge. One ClickHouse row per metric. When the
+message carries a `reference` (dataset **metrics runs** send the example's
+expected output), it is passed to every evaluator as
+`reference=` + `contexts=[reference]` — hallucination verifies claims against
+it, faithfulness treats it as the grounding context, and metrics that don't
+take a reference ignore the extra kwargs. The same worker metric set backs the
+API's synchronous block-mode `/evaluate` (`routes/evaluate/judge.py`) — the
+two lists are kept identical (the `completeness` gap between them was a bug,
+fixed 2026-07-19).
 
 ### Vision-grounded evaluation (`jobs/helper/vision.py`)
 
@@ -319,6 +341,17 @@ Every result becomes a row in `fluiq.evaluations`:
 Non-agentic rows leave `layer`/`run_*` at defaults; agentic dashboards filter on
 `evaluator = 'fluiq.agent_eval'`. The same result is also published as a
 `trace.enriched` event so the API can stream it into the live trace view.
+
+`details.judge_prompts` (see §2) is lifted to the top level of `details` by
+`_persist_eval_result` so the dashboard reads it flat.
+
+**Human rows share this table.** The API (not this worker) writes
+`evaluator = 'human.feedback'` (end-user feedback via `fluiq.feedback()` /
+`POST /api/v1/feedback`) and `'human.annotation'` (dashboard thumbs + note)
+rows with the free-text in `details.comment`. They ride the same read paths as
+judge scores (trace drawer, exports) but are **excluded from the quality rollup
+MV** (`WHERE evaluator NOT LIKE 'human.%'`) so a thumbs-down can't drag the
+automated `quality_min` to 0.
 
 ---
 
