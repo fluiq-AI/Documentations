@@ -11,6 +11,8 @@ throughout.
 | Python SDK (`fluiq-sdk`) | PyPI (`fluiq`) | push a semver **git tag** | `.github/workflows/release.yaml` |
 | TypeScript SDK (`fluiq-sdk-typescript`) | npm (`@fluiq/sdk`) | **GitHub Release published** · manual `workflow_dispatch` | `.github/workflows/publish.yml` |
 | Workers (tracer/evaluator/security) | Amazon ECS | push to `main` · manual | each worker's `.github/workflows/deploy.yml` |
+| Infrager web (`Infrager/apps/web`) | AWS Amplify (app `d1icguwdl9x4aw`) | push to `main` | `amplify.yml` (repo root, `appRoot: apps/web`) |
+| Infrager API (`Infrager/apps/api`) | Amazon ECS (cluster `fluiq`, service `infrager-api`) | **manual** (`docker build` + `docker push`, no workflow yet) | see [Infrager](#infrager) |
 
 > **DB migrations are automatic.** The API applies `db_queues/postgresql/schema.sql`
 > and `db_queues/clickhouse/schema.sql` on startup (`_apply_schema()`), so deploying
@@ -119,6 +121,12 @@ the extra IAM in `fluiq-api-infra-admin-policy.json` (ssm:SendCommand /
 GetCommandInvocation, rds:DescribeDBLogFiles / DownloadDBLogFilePortion) on the
 `fluiqECSTaskRole`; endpoints fail soft until it's attached.
 
+**Shared with Infrager.** Infrager is a separate product (own repo, own domain)
+but it borrows fluiq infrastructure rather than duplicating it: the `fluiq` ECS
+cluster, the `fluiq-api-alb`, the `fluiq-postgres` RDS instance, and the ECS
+security group. Anyone changing those four should know a second product depends
+on them; the exact resources are listed under [Infrager](#infrager).
+
 **Schema deploy ordering.** `_apply_schema()` runs on API boot (idempotent
 `CREATE/ALTER … IF NOT EXISTS`), so **deploy the API before the workers**. New
 columns/tables must exist before a worker's by-name insert references them:
@@ -206,6 +214,60 @@ deploy → wait for stability) against its own ECR repo / ECS service. Push to
 `main` deploys all changed workers; use each workflow's `workflow_dispatch` to
 redeploy one. See `docs/workers.md` for shared topics/auth, and
 `docs/tracer.md` / `docs/evaluator.md` / `docs/security.md` for per-worker env vars.
+
+---
+
+## <a id="infrager"></a>Infrager
+
+Separate product, separate repo (`SaurabhKumbhar24/Infrager`), separate domain,
+but it runs on fluiq's infrastructure to avoid paying twice. npm-workspaces
+monorepo: `apps/web` (Next.js, the canvas/editor) and `apps/api` (Express +
+Postgres). Codegen and security linting run entirely in the browser, so the API
+only stores diagrams.
+
+**Web → Amplify.** App `d1icguwdl9x4aw`, platform **WEB_COMPUTE** (the editor is
+a dynamic `/editor/[id]` route, so static hosting fails). `amplify.yml` sits at
+the repo root with `appRoot: apps/web`; artifact `baseDirectory` is `.next`,
+resolved **relative to appRoot**, not the repo root. Build-time env var
+`NEXT_PUBLIC_API_URL=https://infrager-api.getfluiq.com` is inlined into the
+bundle, so changing the API host requires a rebuild, not just a restart.
+
+**API → ECS.** Cluster `fluiq`, service `infrager-api`, task family
+`infrager-api` (256 CPU / 512 MB, Fargate **Spot**, 1 task). Image
+`383136686684.dkr.ecr.us-east-2.amazonaws.com/infrager-api`, built from
+`apps/api/Dockerfile` with the **repo root as build context** (npm workspaces
+need the root lockfile). Build for `linux/amd64` with `--provenance=false`;
+a multi-platform manifest or an arm64 image fails to start on the x86 task.
+There is no GitHub Actions workflow yet, so releases are manual:
+
+```bash
+aws ecr get-login-password --region us-east-2 | docker login --username AWS \
+  --password-stdin 383136686684.dkr.ecr.us-east-2.amazonaws.com
+docker build --platform linux/amd64 --provenance=false \
+  -f apps/api/Dockerfile -t <ecr>/infrager-api:latest .
+docker push <ecr>/infrager-api:latest
+aws ecs update-service --cluster fluiq --service infrager-api --force-new-deployment
+```
+
+**Fluiq resources it borrows.** Change any of these with Infrager in mind:
+
+| Resource | How Infrager uses it |
+|----------|---------------------|
+| RDS `fluiq-postgres` | Own database + role `infrager`, PUBLIC revoked. No grants on fluiq schemas. |
+| ECS cluster `fluiq` | Runs `infrager-api` alongside the fluiq services. |
+| `fluiq-api-alb` | Listener rule priority 20 on host `infrager-api.getfluiq.com` → target group `infrager-api-tg`. Needed its **own ACM cert** attached via SNI; the listener's original cert only covered `api.getfluiq.com`. |
+| SG `sg-041902003fb6ef7f9` (`fluiq-ecs-sg`) | The API task runs in it, which is why it already reaches RDS. Added ALB → ECS ingress on **4000**. |
+| `fluiqECSTaskExecutionRole` | Extra inline policy `infrager-ssm-secrets-access` for `/infrager/prod/*`. |
+
+**Config** lives in SSM as SecureStrings: `/infrager/prod/DATABASE_URL` and
+`/infrager/prod/AUTH_SECRET`, injected as task `secrets`. Plain env on the task:
+`PORT=4000`, `PGSSL=require`, `CORS_ORIGINS=https://infrager.getfluiq.com`
+(an exact origin match; a mismatch here shows up as browser CORS failures on
+signup, not as an API error). Tables are created on boot, so there is no
+migration step. Logs: `/ecs/infrager-api`, 14-day retention.
+
+**Marketing surface.** `getfluiq.com/infrager` (see `docs/frontend.md`) plus the
+Developer nav dropdown, homepage section, footer, and sitemap entries.
 
 ---
 

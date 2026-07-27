@@ -128,7 +128,7 @@ python -m fluiq.ci --dataset "checkout-agent" --kind metrics \
 Exit codes: `0` pass · `1` threshold failed · `2` error/timeout. Backed by the
 API-key routes `POST/GET /api/v1/ci/eval-runs[/{run_id}]`.
 
-### `fluiq.secure(mode="warn", *, guardrail="default")` *(Growth plan+)*
+### `fluiq.secure(mode="warn", *, guardrail="default")` *(all plans, metered by scan volume)*
 
 Server-side security scanning against the named guardrail policy.
 

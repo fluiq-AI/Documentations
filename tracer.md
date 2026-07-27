@@ -62,7 +62,7 @@ content parts arrive as payload-free `_media_ref`s (see `docs/sdk.md`).
 
 **Processing steps**
 
-1. Generate `trace_id` if missing.
+1. Generate `trace_id` if missing. **Coerce** `trace_id`/`parent_id` to valid UUIDs (`_coerce_uuid`: UUID → passthrough, other non-empty string → deterministic UUIDv5). The API boundary already normalizes these, but this defensive pass keeps a malformed id from any producer from crashing the UUID-column insert and stalling the partition.
 2. Resolve `root_trace_id` **and an `is_root` flag** via the root resolver (LRU cache → ClickHouse → fallback). `is_root` encodes "own root OR orphan (phantom parent never captured)"; a self-referential `parent_id == trace_id` (e.g. CrewAI's crew span) is forced to `is_root = 1`.
 3. Derive the denormalized **agent identity** (`agent_key`, `agent_kind`) from the event: `function` → `chain`/`function`, else `langgraph_node`, else empty. This is what the Agents roll-up groups by, so it's computed once at ingest instead of scanned at read time.
 4. Stamp **`retention_days`** from the org's tier (Free = 14, paid = 36500 "forever"), looked up per org. ClickHouse applies a per-row TTL of `ingested_at + toIntervalDay(retention_days)` — this is the mechanism behind *free, unlimited observability with retention as the only paid axis*.

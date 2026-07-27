@@ -36,6 +36,8 @@ src/
 │   ├── *-alternative/        # comparison pages (langfuse, langsmith, helicone,
 │   │                         #   braintrust, lakera, portkey)
 │   ├── llm-cost-calculator/  # tool page (uses /models)
+│   ├── infrager/             # landing page for Infrager (separate OSS product,
+│   │                         #   app lives at infrager.getfluiq.com)
 │   ├── admin/
 │   └── dashboard/            # authenticated app (see below)
 ├── screens/                  # presentational components rendered by routes
@@ -44,6 +46,7 @@ src/
 │   │              Prompts,Security,Tests,Traces,UserManagement}
 │   ├── Home/ Pricing/ Comparisons/ Platform/ Tools/ Documentation/
 │   ├── Integrations/ Blog/ Authentication/ Legal/ Admin/
+│   ├── Infrager.tsx          # /infrager landing page
 ├── components/ contexts/ lib/ store/ styles/ assets/
 ```
 
@@ -54,7 +57,7 @@ src/
 | Route | Screen | Purpose |
 |-------|--------|---------|
 | `/dashboard/overview` | Overview | Usage, quota, spending, cache-hit & agentic-eval summary tiles |
-| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; **Run Agentic Eval** button in the drawer's Evaluation tab (root traces only); **AnnotateBar** (thumbs + note → `POST /traces/{id}/annotations`); human feedback/annotation rows render with end-user/team badges; per-score **Judge prompts** block shows the exact rendered prompt + version/source behind every eval |
+| `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; the drawer's Evaluation tab runs eval right there (`TraceEvalConfig`): a **single-run** trace (one LLM turn, even with tool calls) shows a metric-chip + custom-scorer picker → `POST /evaluate/trace-metrics`, while a **multi-run** trace (2+ LLM/agent turns) shows the agentic depth/judge/jury config → **Run Agentic Evaluation** (`POST /evaluate/agentic`); both gate on a BYOK provider-key add-key flow; **AnnotateBar** (thumbs + note → `POST /traces/{id}/annotations`); human feedback/annotation rows render with end-user/team badges; per-score **Judge prompts** block shows the exact rendered prompt + version/source behind every eval |
 | `/dashboard/agents` | Agents | Per-agent cost / token / latency rollup |
 | `/dashboard/security` | Security | Security risk panel; agentic threat verdicts |
 | `/dashboard/guardrails` | Guardrails | Guardrail policy editor |
@@ -131,7 +134,15 @@ Wraps `apiRequest` with automatic token refresh. Uses the access token from Redu
 
 ### Domain helpers — `src/lib/`
 
-`blog.ts` (public blog fetch + media URLs), `models.ts` (cost-calculator `/models`), `prerender.ts` (build-time blog prerender), `seo.ts` / `seo-pages.ts` (metadata), `router-compat.tsx` (compat shim easing the React-Router → App-Router migration), `faqs.ts`, `utils.ts`.
+`blog.ts` (public blog fetch + media URLs), `models.ts` (cost-calculator `/models`), `useModels.ts` (the eval model catalog from `/evaluate/models`, module-cached; `toSpecs`/`specLabel` turn rows into `provider:model` judge/jury specs), `prerender.ts` (build-time blog prerender), `seo.ts` / `seo-pages.ts` (metadata), `router-compat.tsx` (compat shim easing the React-Router → App-Router migration), `faqs.ts`, `utils.ts`.
+
+### Shared eval building blocks — `src/components/`
+
+Three pieces are reused across the Prompts, Datasets, and Traces eval surfaces so
+model lists and BYOK are consistent everywhere:
+
+- **`SearchSelect.tsx`** — single-select searchable combobox; **`MultiSelectDropdown.tsx`** gained a `searchable` mode. Every model/judge/jury picker uses one of these fed by `useModels()`, so there are no hardcoded model catalogs in the UI.
+- **`ProviderKeys.tsx`** — the shared BYOK layer: `useProviderKeys()` (reads `/api/v1/credentials`), `missingKeyProviders()`, `MissingKeysCallout`, and `ProviderKeyDialog` (verify + save an encrypted key). Any drawer that will call a provider gates its Run button on the in-use providers having a key and offers an inline add-key flow.
 
 ---
 
@@ -218,9 +229,11 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 | Datasets | `GET …/runs/{id}/compare?against=` | Run-vs-run regression comparison |
 | JudgePrompts | `GET/PUT /api/v1/eval/judge-prompts[/{name}]`, `POST …/reset`, `GET …/versions`, `POST …/restore/{v}` | Org judge-prompt overrides |
 | Traces | `POST /api/v1/traces/{id}/annotations` | AnnotateBar (team thumbs + note) |
+| Traces | `POST /api/v1/evaluate/trace-metrics` · `POST /api/v1/evaluate/agentic` | Single-run metric/custom-scorer eval · multi-run agentic eval (drawer Evaluation tab) |
 | Prompts | `GET/POST /api/v1/prompts`, `PATCH/DELETE …/{id}` | Template CRUD |
 | Prompts | `POST …/{id}/environments/{env}` · `GET …/{id}/versions` · `POST …/versions/{v}/restore` | Env deploy / versions |
-| Prompts | `POST /api/v1/evaluate/compare` | Compare models in playground |
+| Prompts | `POST /api/v1/evaluate/compare` | Compare models across providers in the eval drawer (BYOK, per-model metric scoring) |
+| Prompts/Datasets/Traces | `GET /api/v1/evaluate/models` · `GET /api/v1/credentials` · `POST /api/v1/credentials` | Table-driven model picker · BYOK key gate + add-key dialog |
 | Audit | `GET /api/v1/audit` | Request audit log |
 | ApiManagement | `GET/POST /api-keys`, `DELETE /api-keys/{key_id}` | Key management |
 
@@ -265,6 +278,8 @@ interface GuardrailPolicy {
 
 `ALL_CATEGORIES`: `prompt_injection, jailbreak, skeleton_key, semantic_attack, pii_detected, secrets_detected, indirect_injection, rag_poisoning, tool_exfiltration, tool_policy_violation, cross_agent_injection`.
 `PII_ENTITIES`: `US_SSN, CREDIT_CARD, IBAN_CODE, CRYPTO, US_PASSPORT, EMAIL_ADDRESS, PHONE_NUMBER, PERSON, LOCATION, IP_ADDRESS`.
+
+> **No UI yet for `alert_webhook` / `alert_on`.** The Guardrails page (`screens/Dashboard/Guardrails/index.tsx`) loads and round-trips both fields (so a `PUT` preserves them) but renders no input for them, so today the custom alert webhook is settable only via `PUT /api/v1/guardrails`. The user-facing behavior is documented in `screens/Documentation/AlertsPage.tsx` ("Custom webhook"). TODO: add the webhook field to the Guardrails page.
 
 ---
 
@@ -370,4 +385,4 @@ SSE event names: `ready`, `ping`, `trace`, `trace.started`, `trace.enriched`.
 - **`authFetch` errors** — `ApiError.detail` surfaced in component state.
 - **SSE fatal errors** — `FatalSseError` captured by `useRealtimeStream`, rendered with context-specific messaging (quota exceeded, auth failure, server error).
 - **Token expiry** — handled silently by `authFetch` (single refresh before logout).
-- **Tier gate (402)** — surfaces as an upgrade prompt; `fluiq.secure()` / `/secure/check` gate Free/Team plans (Growth+ required), and `/optimize/profile` gates Free (Team+ required).
+- **Quota exhausted (402)** — surfaces as an upgrade prompt; `/secure/check` returns it once the org has spent its monthly scan allowance, not because of its plan (Growth+ required), and `/optimize/profile` gates Free (Team+ required).

@@ -165,6 +165,37 @@ Production infra: Kafka on **AWS MSK** (SASL/SCRAM over TLS), ClickHouse self-ho
 
 Plus public marketing surfaces built into the same app: the LLM cost calculator (`/models`), an in-house blog CMS (TipTap editor, prerender-on-publish for SEO), per-pillar landing pages, and competitor-comparison pages.
 
+### 4.4 Companion Open-Source Products
+
+Two standalone products ship under the FluiqAI name, both MIT licensed and free.
+Neither requires a Fluiq account and neither is monetized directly. They exist
+because the fastest way to reach the engineers who eventually need the platform
+is to be useful to them before they need it.
+
+| Product | What it is | Where it lives |
+|---------|-----------|----------------|
+| **polygate** | Unified LLM client: one interface across providers, so switching models is a string change instead of a rewrite | `polygate.getfluiq.com` · PyPI + npm |
+| **Infrager** | Drag-and-drop cloud architecture diagrams compiled into production-ready Terraform, with security linting (open security groups, public buckets, unencrypted storage, wildcard IAM) that runs on the diagram as you draw. AWS and Google Cloud today | `infrager.getfluiq.com` · GitHub |
+
+**Why they earn their keep:**
+
+1. **Distribution.** Both target searches Fluiq does not otherwise rank for
+   (`diagram to terraform`, `unified LLM client`) and reach developers earlier
+   in their workflow, before an observability tool is on the shopping list.
+2. **Credibility.** Working, inspectable code is a stronger claim about
+   engineering quality than a marketing page. This matters against incumbents
+   like Langfuse, whose own credibility is partly open-source based.
+3. **Audience overlap.** The person wiring up multi-provider LLM calls or
+   provisioning the infrastructure an agent runs on is the same person who
+   later has to explain a runaway inference bill or a prompt-injection incident.
+4. **Shared infrastructure.** Infrager runs on the existing ECS cluster, ALB,
+   and RDS instance, so the marginal cost is a few dollars a month rather than a
+   second platform to operate (see `docs/deployments.md`).
+
+The honest limitation: neither has an attribution path back to signups today,
+so their contribution is inferred from referral traffic rather than measured.
+Adding that instrumentation is worth doing before either gets more investment.
+
 ---
 
 ## 5. Market Analysis
@@ -489,7 +520,7 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 
 2. **Developer community presence**
    - Answer LLM observability questions on Reddit (r/MachineLearning, r/LangChain), HackerNews, and Discord communities
-   - Ship useful open-source utilities to drive GitHub visibility
+   - Ship useful open-source utilities to drive GitHub visibility. Two are live: **polygate** (unified LLM client) and **Infrager** (cloud diagrams to secure Terraform), both MIT and free. See [§4.4](#44-companion-open-source-products). Each gets its own launch: Infrager suits r/devops, r/Terraform, and HackerNews; polygate suits the LLM communities
    - Submit to product directories: Product Hunt, There's An AI For That, Futurepedia
 
 3. **Integration ecosystem**
@@ -624,6 +655,7 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 - **Alerts**: Slack alerting on eval/security thresholds via a dedicated alert consumer (stable shared group, fires once)
 - **Auth & admin**: password + Google/GitHub OAuth, OTP password reset, tamper-evident (HMAC) audit log, admin console
 - **Marketing surfaces**: in-house blog CMS (prerender-on-publish SEO, S3 media), LLM cost calculator, pillar + competitor-comparison pages
+- **Open-source companions** (§4.4): **polygate** (unified LLM client, PyPI + npm) and **Infrager** (diagram → Terraform with security linting, AWS + GCP), both live, MIT, and free; Infrager reuses the existing ECS/ALB/RDS footprint
 - **Dashboard**: 13+ pages, real-time SSE streaming, dark mode, full observe/secure/eval/optimize coverage
 - **Async pipeline & infra**: three Kafka workers (tracer, evaluator, security); self-hosted Kafka on EC2 (migrated off MSK to cut ~87% of that line item), self-hosted ClickHouse on EC2, PostgreSQL on RDS, Redis, S3; per-run roll-ups (AggregatingMergeTree); Fargate-Spot autoscaling to a ~$150/mo budget; cost estimation with provider rates
 

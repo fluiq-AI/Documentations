@@ -57,8 +57,37 @@ on small instances. Judge calls are network-bound, so throughput is fine.
 
 Every metric that needs a model uses `LLMJudge` (`jobs/helper/judge.py`):
 
-- **Pluggable providers:** `openai`, `anthropic`, `gemini`, `fluiq`. Selected by
-  `EVAL_JUDGE_PROVIDER` / `EVAL_JUDGE_MODEL`.
+- **Pluggable providers:** `openai`, `anthropic`, `gemini`, `moonshot`.
+  Selected by `EVAL_JUDGE_PROVIDER` / `EVAL_JUDGE_MODEL`, or per message via
+  `judge` / `jury`.
+- **Text judging goes through [polygate](opensource.md).** Every text judge call
+  funnels through one method, `_chat_via_polygate`, which calls `polygate.chat`
+  instead of a per-provider SDK — so the whole worker has a single LLM transport.
+  It builds a `system` + `user` message list and requests JSON mode the way each
+  provider expects: `response_format={"type":"json_object"}` for `openai` /
+  `moonshot`, `generationConfig.responseMimeType="application/json"` for `gemini`
+  (which must also carry `temperature`, since polygate's `payload.update(kwargs)`
+  replaces the whole `generationConfig`), and — since Anthropic has no JSON mode —
+  a system-prompt instruction plus the tolerant `_parse_json_object` for
+  `anthropic`. Retries are opt-in via `Retry(max_attempts=EVAL_JUDGE_RETRY_ATTEMPTS)`
+  (default 3, polygate handles backoff + key rotation). The four
+  `_call_openai/_moonshot/_anthropic/_gemini` methods remain as thin delegators
+  because `run.py`'s BYOK `_underlying` still dispatches to them by name.
+  Moonshot (Kimi) stays bring-your-own-key only — the key-leak guard is now
+  structural: polygate reads `MOONSHOT_API_KEY` and never falls back to
+  `OPENAI_API_KEY`, so a keyless Moonshot call raises rather than sending an
+  OpenAI key to Moonshot's host. Kimi K2 is text-only, so it is absent from
+  `_PROVIDER_MEDIA` in `vision.py` and vision metrics report not-applicable for
+  it rather than failing.
+- **The vision/multimodal path stays on native SDKs.** `_call_*_mm` and
+  `_usage_*` keep using `anthropic` / `google-genai` / `openai` directly, because
+  polygate's string-content messages can't express image blocks across every
+  provider — so those SDKs stay in `requirements.txt` alongside `polygate>=0.2`.
+- **The `fluiq` judge provider was removed.** There is no longer a managed
+  `fluiq`/`fluiq-judge` provider or a `_call_fluiq` transport (it used to POST to
+  `api.getfluiq.com/v1/judge`); a stray `fluiq:…` judge spec now degrades to the
+  server default. (The unrelated `source="fluiq"` in the agentic adapters is the
+  SDK trace-envelope name, not a judge provider.)
 - **JSON-only output:** every judge call forces a single JSON object; a tolerant
   parser (`_parse_json_object`) recovers if the model wraps it in prose.
 - **Response cache:** `PromptCache` + `InMemoryCache` — an LRU keyed by
@@ -306,6 +335,70 @@ the `parent_ids` fan-in capture — a synthesizer that ignores a branch is a
 coordination failure L1–L3 can't see. Metric `agentic.coordination`; the judge
 only runs on join nodes, so single-agent and linear runs cost nothing here.
 
+### Judge and jury selection
+
+The judge is not fixed to the server default. An eval message may carry:
+
+* `judge`: `"provider:model"` for the primary judge
+* `jury`: a list of `"provider:model"` for the panel (used at `depth: "deep"`)
+
+Both are parsed by `parse_judge_spec` / `parse_jury_specs` in `jobs/run.py`, which
+validate the provider against `PROVIDERS` and fall back to the configured default
+on anything unusable. A malformed jury entry is dropped rather than failing the
+run: a jury of two good members is still a jury, and the alternative is one typo
+costing a customer a whole batch.
+
+### Bring your own key (BYOK)
+
+`OrgCredentials` resolves an org's provider credentials **once per message**, not
+per judge call. Resolving per call would mean a Postgres round trip and a KMS
+unwrap for every juror; a three-model jury across three metrics would pay that
+nine times for one eval.
+
+Failure handling is deliberately asymmetric:
+
+* No credential for the provider → managed key, exactly as before.
+* Credential present but `invalid`, or undecryptable → raise `BYOKUnavailable` and
+  **stop**. Falling back would bill Fluiq for usage sold as bring-your-own-key and
+  hide a broken credential from whoever has to rotate it.
+* Postgres unreachable → fall back to managed keys and log at ERROR. This is the
+  one deliberate fail-open: a database blip should not stop every eval in the
+  fleet, and the cost is bounded and noisy rather than silent.
+
+When a provider rejects a customer key mid-eval, `note_auth_failure` schedules a
+write flipping the row to `invalid` so the dashboard stops showing it Active.
+Detection (`is_auth_error`) is conservative on purpose: a false positive would
+disable a working customer key, so a 429 or a timeout is never treated as one.
+
+### Judge-token accounting
+
+`JudgeUsage` accumulates the tokens each provider call actually spent. One
+instance is shared by the primary judge and every juror for a message, so a
+panel's cost lands in one place. Two rules follow from that:
+
+* **Cache hits do not accumulate.** `PromptCache` wraps the judge outside the
+  provider call, so a served-from-cache verdict never reaches the counter. That is
+  correct for billing, and it makes `EVAL_JUDGE_CACHE` real margin.
+* **Usage is drained, not read.** One message can persist several metric rows, and
+  a jury's calls are not divisible per metric. The totals land on the first row and
+  later rows carry zeros, so `SUM` over a message's rows is its true spend. Any
+  per-row or `AVG` reading is meaningless.
+
+Anthropic cache-read and cache-creation tokens are counted as input: they are
+billed at a different rate but they are billed, and omitting them would
+systematically under-report.
+
+### Judge cache tenancy
+
+`_judge_cache_backend` is a single process-wide `InMemoryCache` shared by every
+org the worker handles, so its key **must** carry the tenant. It is namespaced by
+`organization_id` plus the fingerprint of the credential that paid for the call.
+Without the org in the key, two tenants whose rendered judge prompts collide share
+a verdict, which leaks one org's judged content (the trace is embedded in the
+prompt) to the other. A message with no organization disables caching entirely
+rather than guessing at the tenant. Regression tests:
+`tests/test_judge_cache_tenancy.py`.
+
 ### Depth tiers
 
 | Depth (`EVAL_AGENT_DEPTH` or per-message `depth`) | Layers run | Use for |
@@ -431,8 +524,9 @@ render via `judge_prompts.render(name, **vars)`.
 |---------|---------|-------------|
 | `KAFKA_EVAL_TOPIC` / `KAFKA_EVAL_GROUP_ID` | `evaluations` / `evaluator-workers` | Input topic + consumer group |
 | `KAFKA_PLAYGROUND_REPLY_TOPIC` | — | Playground request-reply topic |
-| `EVAL_JUDGE_PROVIDER` / `EVAL_JUDGE_MODEL` | `openai` / provider default | Judge provider + model |
-| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | — | Required for the matching judge provider (and vision judging) |
+| `EVAL_JUDGE_PROVIDER` / `EVAL_JUDGE_MODEL` | `openai` / provider default | Judge provider (`openai`/`anthropic`/`gemini`/`moonshot`) + model |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `MOONSHOT_API_KEY` | — | Read by polygate for the matching text judge (and the native-SDK vision path); Moonshot is BYOK-only |
+| `EVAL_JUDGE_RETRY_ATTEMPTS` | `3` | polygate `Retry` attempts for text judge calls (`1` disables) |
 | `EVAL_JUDGE_THRESHOLD` | `0.7` | Global pass threshold |
 | `EVAL_JUDGE_CACHE` / `_TTL` / `_MAX` | `1` / `3600` / `2048` | Judge response cache |
 | `EVAL_JUDGE_PROMPT_TTL` | `60` | Seconds a judge-prompt snapshot is trusted before refresh |
@@ -465,12 +559,16 @@ Dataset batch run --------->  agent_eval / security       (per example, over pin
   span events straight into the same Layer-0 normalizer and layered pipeline, so
   agentic scoring works offline and is independent of the source trace's
   retention window. See `docs/api.md` (Datasets) and `docs/backend.md`.
-- **Agentic evaluation is explicit and root-only.** Agentic eval scores a *whole
+- **Agentic evaluation is explicit and multi-run.** Agentic eval scores a *whole
   run* — the root span plus its tool/MCP subtree, keyed by `root_trace_id` — so
-  the **Run Agentic Eval** button appears in the drawer's **Evaluation** tab
+  the **Run Agentic Evaluation** config appears in the drawer's **Evaluation** tab
   **only when the open trace is a root** (it is its own root, has no
-  `root_trace_id`, or is the visible root of its group). It is intentionally
-  hidden on child spans and on a selected tool, because a single span has no run
-  to evaluate. On click, the API fetches every span sharing that
-  `root_trace_id`, publishes one `agent_eval` job, and the layered pipeline runs;
-  results stream back over the SSE `trace.enriched` channel.
+  `root_trace_id`, or is the visible root of its group) **and the run has more
+  than one LLM/agent turn**. A single LLM turn — even one that makes tool calls —
+  counts as single-run and instead gets the metric/custom-scorer eval
+  (`/evaluate/trace-metrics`); the multi-run detector counts only `type == "llm"`
+  nodes in the tree, not tool/MCP spans. It is likewise hidden on child spans and
+  on a selected tool, because a single span has no run to evaluate. On click, the
+  API fetches every span sharing that `root_trace_id`, publishes one `agent_eval`
+  job, and the layered pipeline runs; results stream back over the SSE
+  `trace.enriched` channel.

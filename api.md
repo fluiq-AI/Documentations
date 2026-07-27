@@ -113,6 +113,8 @@ Primary SDK ingestion endpoint. API key auth.
 
 `trace_id` is auto-generated if omitted. `status:"running"` events stream to SSE but are not persisted. Keys prefixed with `_` (`_eval`, `_eval_config`, `_security_config`, `_cache_hit`) are stripped before storage and drive the eval/security fan-out.
 
+**Identifier normalization.** `trace_id`, `root_trace_id`, and `parent_id` are coerced to valid UUIDs at ingest (`shared/ids.py::coerce_trace_uuid`): a value that is already a UUID passes through, any other non-empty string is mapped to a deterministic UUIDv5 (same string → same UUID, so a non-UUID trace tree stays internally linked). ClickHouse stores these as UUID columns, so without this a non-UUID id would crash the tracer insert and drop the trace; the response returns the effective (possibly remapped) `trace_id`. The tracer applies the same coercion defensively.
+
 **Evaluation is opt-in.** The API only publishes an eval job when the SDK opted in — `eval_enabled = _eval or (_eval_config is not None)`. A trace ingested by `instrument()` alone (no `fluiq.eval()`) is traced but **not** evaluated; the old ambient auto-eval sample rate is gone. Retrieval/LLM auto-scoring likewise only fires when eval is enabled.
 
 **Response** `200 OK`
@@ -228,16 +230,23 @@ Plan tier and quota usage (JWT auth).
 
 **Response** `200 OK`
 ```json
-{ "tier": "Team", "traces": { "used": 12340, "limit": null }, "evaluations": { "used": 870, "limit": 10000 } }
+{ "tier": "Team", "traces": { "used": 12340, "limit": null }, "evaluations": { "used": 870, "limit": 10000 },
+  "security_scans": { "used": 41200, "limit": 500000 }, "retention_days": null, "trial_ends_at": null }
 ```
 `null` limit = unlimited.
 
-| Tier | Traces | Retention | Evaluations / month |
-|------|--------|-----------|---------------------|
-| Free | Unlimited | 14 days (rolling) | 1,000 |
-| Team | Unlimited | Forever | 10,000 |
-| Growth | Unlimited | Forever | 100,000 |
-| Enterprise | Unlimited | Forever | Unlimited |
+| Tier | Traces | Retention | Evaluations / month | Security scans / month |
+|------|--------|-----------|---------------------|------------------------|
+| Free | Unlimited | 14 days (rolling) | 100 | 1,000 |
+| Starter | Unlimited | Forever | 2,000 | 50,000 |
+| Team | Unlimited | Forever | 10,000 | 500,000 |
+| Growth | Unlimited | Forever | 50,000 | 2,000,000 |
+| Enterprise | Unlimited | Forever | Unlimited | Unlimited |
+
+Security scans are metered separately from evaluations because they cost something
+different to run: scanning is regex plus spaCy NER with no LLM call, roughly
+$0.0002 a scan against $0.03 or more for an agentic evaluation. See
+`TIER_SECURITY_QUOTAS` in `shared/quotas.py`.
 
 **Observability is free and unlimited on every tier.** There is no trace/span/agent
 cap. The only paid axis is **retention**: Free keeps a rolling 14-day window, paid
@@ -246,10 +255,78 @@ stamps `retention_days` on each row from the org's tier at ingest (see `docs/tra
 
 ### POST `/api/v1/billing/trial`
 
-Starts a no-card **5-day trial** of a paid tier (Team or Growth) for the org (JWT
+Starts a no-card **5-day trial** of a paid tier (Starter, Team, or Growth) for the org (JWT
 auth). Sets `users.trial_ends_at`; the tier is resolved lazily and auto-expires
 back to Free when the window passes. Body: `{ "tier": "Team" | "Growth" }`. One
 trial per org (`users.trial_used`).
+
+---
+
+### GET `/api/v1/quota/judge-usage`
+
+Judge tokens spent by this org, in total and split by evaluator (JWT auth).
+Query: `days` (1-365, default 30).
+
+**Response** `200 OK`
+```json
+{ "window_days": 30, "input_tokens": 1840233, "output_tokens": 91200,
+  "judge_calls": 4120, "eval_runs": 1370,
+  "by_evaluator": [{ "evaluator": "fluiq.agent_eval", "input_tokens": 1700000,
+                     "output_tokens": 84000, "judge_calls": 3900, "eval_runs": 1200 }] }
+```
+
+Aggregated in ClickHouse rather than by the caller. The `judge_*` columns on
+`fluiq.evaluations` carry a whole eval message's totals on its **first** row, with
+later rows of the same message at zero, because a jury's calls are not divisible
+per metric. `SUM` over the window is therefore exact and any per-row or `AVG`
+reading is meaningless. `eval_runs` counts distinct `trace_id`, which is the
+billable unit; metric rows are not.
+
+Returns tokens, never cost: the price of a token is a policy decision that
+changes, while the count is ground truth.
+
+---
+
+## Provider credentials (BYOK)
+
+Customer-supplied provider keys, used to run an org's judge calls on its own
+provider account. Envelope-encrypted at rest (see `shared/crypto.py`): a
+per-credential data key from KMS, AES-256-GCM ciphertext in Postgres, and the org
+id bound in as additional authenticated data so a row read under the wrong org
+fails its tag check instead of decrypting.
+
+**There is no endpoint that returns a stored key**, for any role including admin.
+
+### GET `/api/v1/credentials`
+
+Lists this org's credentials (JWT). Never includes key material.
+
+**Response** `200 OK`
+```json
+{ "configured": true, "providers": ["anthropic", "azure_openai", "bedrock", "gemini", "moonshot", "openai"],
+  "credentials": [{ "credential_id": "…", "provider": "anthropic", "label": "Prod",
+                    "key_preview": "…a1B2", "fingerprint": "9f2c…", "status": "active",
+                    "last_verified_at": "…", "last_error": null, "created_at": "…" }] }
+```
+
+`configured: false` means no encryption backend is set on the deployment, so the
+feature is off rather than degraded. There is deliberately no unencrypted path.
+
+### POST `/api/v1/credentials`
+
+Saves a key (JWT). Verified against the provider first with a free, token-less
+list-models call, so a typo is rejected at paste time rather than surfacing as a
+failed eval hours later. A rejected key returns **422**, not 401: the caller's
+session is fine, the key is not.
+
+### POST `/api/v1/credentials/{credential_id}/verify`
+
+Re-checks a stored key and flips `status` to `active` or `invalid`.
+
+### DELETE `/api/v1/credentials/{credential_id}`
+
+Hard-deletes the row and flushes the decrypted-data-key cache, so revocation is
+immediate rather than eventually consistent. `204`.
 
 ---
 
@@ -320,7 +397,11 @@ CI eval gate (API key). Query: `window_minutes` (def 30), `threshold` (def 0.7),
 
 ### POST `/api/v1/secure/check`
 
-Pre-call security guard. Called by the SDK in block mode before forwarding the prompt. API key auth. **Requires Growth plan or above** (402 otherwise).
+Pre-call security guard. Called by the SDK in block mode before forwarding the prompt. API key auth.
+
+**Available on every plan**, including Free. Gated by scan volume rather than tier:
+a 402 is returned only once the org has used its monthly allowance
+(`TIER_SECURITY_QUOTAS`), not because of the plan it is on.
 
 **Request**
 ```json
@@ -328,7 +409,7 @@ Pre-call security guard. Called by the SDK in block mode before forwarding the p
   "trace_id": "uuid", "guardrail": "default", "context": { } }
 ```
 
-Flow: allow-list → deny-list → fast pattern check → full scan via the security worker (`security_check_sync`, with `{block_threshold, block_categories, pii_ignore}`) → pattern-only fallback on timeout (**fail-open**).
+Flow (order matters for security): **deny-list** (hard block) → **fast pattern check** → **allow-list** short-circuit → **full scan** via the security worker (`security_check_sync`, with `{block_threshold, block_categories, pii_ignore}`) → **pattern-only fallback** on timeout (**fail-open**; set `SECURE_FAIL_CLOSED` to block instead). The deny-list and the pattern block are evaluated *before* the allow-list, so an allow-listed phrase cannot neutralize a real attack embedded next to it. The fast pattern check (`routes/secure/scanners.py`) is tiered and word-boundary/case-sensitive-acronym aware (mirrors the worker), so a single ambiguous phrase (`act as`, `dark mode`, a Jinja `{{`) is LOW, not a HIGH block, and acronyms like `DAN` never match inside `guidance`/`claim`.
 
 **Response** `200 OK`
 ```json
@@ -382,7 +463,7 @@ Delete a non-default policy (JWT). Query: `slug` (required). **Errors** · `400`
 ## Alerts
 
 ### GET `/api/v1/alerts` · PUT `/api/v1/alerts`
-Get / save the org's Slack alert settings (JWT). Eval alerts require **Team+**; security alerts require **Growth+**.
+Get / save the org's Slack alert settings (JWT). Both eval and security alerts require **any paid plan** (Starter and above).
 
 ### POST `/api/v1/alerts/test`
 Fire a test Slack message to the configured webhook (JWT).
@@ -438,7 +519,7 @@ to S3), so agentic eval / security can run over it offline, retention-independen
 | `POST /api/v1/datasets/{id}/examples` | Add `{ input, expected_output?, metadata }`. Pass `metadata.source_trace_id` (the run's **root** trace id) and the server snapshots that run's full trajectory + derives an IO summary. Empty-input trace-backed examples are accepted (e.g. a CrewAI crew root). |
 | `DELETE /api/v1/datasets/{id}/examples/{example_id}` | Remove example |
 | `GET /api/v1/datasets/{id}/examples/{example_id}/trajectory` | The pinned trajectory as a compact, display-ready summary (DFS-ordered steps with type/agent/model/tool-calls/MCP/media + rollup stats) |
-| `POST /api/v1/datasets/{id}/runs` | Launch a batch run `{ kind: "agentic" \| "security" \| "metrics", depth?, metrics?, custom_judges? }` over every example. `kind:"metrics"` grades each example's recorded answer against its `expected_output` with the chosen metrics (fresh trace ids per run for clean attribution; `metadata.output` is used as the answer when present) |
+| `POST /api/v1/datasets/{id}/runs` | Launch a batch run `{ kind: "agentic" \| "security" \| "metrics", depth?, metrics?, custom_judges? }` over every example. `kind:"metrics"` grades each example's recorded answer against its `expected_output` with the chosen metrics (fresh trace ids per run for clean attribution; `metadata.output` is used as the answer when present). Also accepts `judge` and `jury` as `"provider:model"`, applied to every example in the run |
 | `GET /api/v1/datasets/{id}/runs` · `GET /api/v1/datasets/runs/{run_id}` | List runs · fetch a run's report (per-metric averages + per-item scores for `metrics` runs) |
 | `GET /api/v1/datasets/runs/{run_id}/compare?against={run_id}` | **Run-vs-run regression report** (agentic + metrics kinds): per-metric deltas over examples present in both runs, and per-example `regressed / improved / unchanged` (ε = 0.05), joined by `example_id` |
 | `POST /api/v1/datasets/{id}/agents` · `GET`/`DELETE .../agents` | **Connect Agents**: link a traced agent → imports all its runs to date (deduped, full trajectory pinned) and auto-appends future runs |
@@ -478,13 +559,63 @@ Results are stored in ClickHouse and fanned out to SSE (one `enriched` message p
 ### POST `/api/v1/evaluate/playground`
 JWT-authed playground. Publishes a `playground_eval` job to the eval worker and awaits its reply (judge logic lives only in the worker). Same response shape. **Errors** · `504` worker timeout.
 
+### GET `/api/v1/evaluate/models`
+JWT-authed. The chat-model catalog that drives every model picker in the app
+(Prompts compare drawer, judge/jury selectors, Datasets + Traces eval). Read
+straight from the `model_prices` table (`modality='Text'`, providers Anthropic /
+OpenAI / Google / Moonshot) so there is **no hardcoded model list** in the
+frontend or the API — adding a row to `model_prices` makes the model selectable
+everywhere. Non-chat models (audio/image/embedding/realtime/dated snapshots) are
+filtered out and slugs are prettified for display.
+```json
+{ "models": [ { "id": "claude-sonnet-5", "label": "Claude Sonnet 5", "provider": "anthropic" } ] }
+```
+
 ### POST `/api/v1/evaluate/compare`
-JWT-authed. Runs the same prompt against multiple Claude models in parallel (`claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, `claude-opus-4-7`), returning per-model output, latency, tokens, and estimated cost.
+JWT-authed **BYOK**. Runs the same prompt against several models **in parallel,
+across providers** (Anthropic / OpenAI / Gemini / Moonshot), each call made with
+the org's own stored provider key (see **Provider credentials**) over plain
+`httpx` — no provider SDKs. Models are validated against `/evaluate/models`.
+Returns per-model output, latency, tokens, and estimated cost (priced from
+`model_prices`). When `metrics` (and a `judge_model`) are supplied, each model's
+output is also scored on those metrics by a BYOK LLM-as-judge and returned as a
+per-model `metrics` array. A model whose provider key is missing returns a
+per-model error rather than failing the whole request.
+
+**Request** `{ "prompt": "...", "models": ["claude-sonnet-5", "gpt-5.6-sol"],
+"metrics"?: ["relevance"], "judge_model"?: "claude-haiku-4-5", "context"?: "..." }`
+
+### POST `/api/v1/evaluate/trace-metrics`
+JWT-authed **BYOK**. Scores a **single trace** (one LLM turn — including one that
+makes tool calls) on built-in metrics and/or custom client judges, using the
+org's own provider key for the judge. Backs the **single-run** mode of the trace
+drawer's Evaluation tab. Results are persisted to ClickHouse `evaluations`
+(`evaluator = "fluiq.eval"`) and streamed back over SSE (one enriched message per
+metric), so the score renders inline on the trace.
+
+**Request** `{ "trace_id": "uuid", "root_trace_id": "uuid?", "prompt": "...",
+"response": "...", "context"?: "...", "metrics": ["relevance", "coherence"],
+"judge_model": "claude-haiku-4-5", "custom_judges"?: { "refund-policy": 0.9 },
+"thresholds"?: {} }` → same `EvaluateResponse` shape as `/evaluate`.
 
 ### POST `/api/v1/evaluate/agentic`
-JWT-authed. Triggers **agentic (multi-layer) evaluation** for a whole run — fired by the **Run Agentic Eval** button in the trace drawer (root traces only). Fetches every span sharing the `root_trace_id`, publishes one `agent_eval` job to the eval worker (async), and returns immediately; layered results (deterministic + tool-selection + trajectory [+ panel]) stream back over the SSE `trace.enriched` channel. Quota-gated.
+JWT-authed. Triggers **agentic (multi-layer) evaluation** for a whole run — fired by the **Run Agentic Evaluation** button in the trace drawer's **multi-run** mode (a root trace with more than one LLM/agent turn; a single LLM turn — even one with tool calls — uses `/evaluate/trace-metrics` instead). Fetches every span sharing the `root_trace_id`, publishes one `agent_eval` job to the eval worker (async), and returns immediately; layered results (deterministic + tool-selection + trajectory [+ panel]) stream back over the SSE `trace.enriched` channel. Quota-gated.
 
-**Request** `{ "trace_id": "uuid", "root_trace_id": "uuid?", "depth": "fast|standard|deep?" }`
+**Request**
+```json
+{ "trace_id": "uuid", "root_trace_id": "uuid?", "depth": "fast|standard|deep?",
+  "judge": "anthropic:claude-sonnet-5",
+  "jury": ["anthropic:claude-haiku-4-5", "openai:gpt-4o-mini"] }
+```
+
+`judge` and `jury` are `"provider:model"` strings, the same vocabulary the API,
+the Kafka message, and the evaluator all use, so there is no translation layer to
+keep in sync. Both fall back to the server default when absent or unparseable, so
+an older SDK keeps working and a bad value from a dropdown degrades rather than
+failing a run. `jury` applies only at `depth: "deep"`, where a panel is convened.
+
+With a saved provider credential the selected provider's key is the org's own, so
+judge tokens bill to their account (see **Provider credentials** above).
 **Response** `200 OK` `{ "ok": true, "trace_id": "uuid", "status": "queued", "events": 7 }` · `status:"skipped"` when eval quota is exceeded. **Errors** · `404` no trace events · `422` invalid id.
 
 ### GET `/api/v1/evaluate/agentic-summary?window_hours=24`

@@ -38,14 +38,61 @@ single executor thread (torch/spaCy memory control). Routes on `operation`:
 | Module | Detects |
 |--------|---------|
 | `pii.py` | PII via Presidio (redaction + entity list) |
-| `injection.py` | Direct prompt-injection patterns |
+| `injection.py` | Direct prompt-injection patterns (tiered strong/weak) |
 | `jailbreak.py` | Jailbreak / role-play escapes (tiered strong/weak) |
-| `skeleton_key.py` | Skeleton-key attack patterns (Microsoft KB) |
+| `skeleton_key.py` | Skeleton-key attack patterns (Microsoft KB; tiered strong/weak) |
 | `secrets.py` | Hardcoded credentials / high-entropy tokens |
 | `semantic.py` | Cosine-similarity attack classifier (sentence-transformers) |
 | `image_scan.py` | OCR of image media → text scanned for injection (pluggable, fail-open) |
 | `openinference.py` | Normalizes raw OpenInference spans → scannable fields (fallback) |
 | `scanners.py` | Orchestrator — `scan()` (full post-call) and `check()` (pre-call patterns only) |
+
+### Pattern matching & tiering (`base.py`)
+
+All three pattern scanners (injection, jailbreak, skeleton-key) share the tiered
+model in `base.py`:
+
+- **Word boundaries** are added only on *alphanumeric* edges, so short persona
+  acronyms (`DAN`, `STAN`, `AIM`, …) match whole words — never as substrings
+  inside `guidance`/`claim`/`understanding` — while delimiter markers like
+  `[system]:` / `<|im_start|>system` / `{{` keep matching as-is. Acronyms are
+  compiled **case-sensitive** so they don't fire on ordinary lowercase words.
+- **Tiered scoring** (`_scan_tiered`): a **STRONG** phrase is HIGH on a single
+  match; **WEAK/ambiguous** phrases are LOW alone and MEDIUM only when two or
+  more co-occur. This keeps benign steering out of the HIGH (blocking) band —
+  e.g. `act as`, `dark mode`, `from now on`, a Jinja `{{ … }}`, `make an
+  exception`, and the bare persona openers `you are now` / `you are no longer` /
+  `you are not an AI` all live in the WEAK tier. Only unambiguous completions
+  (`you are now unrestricted`, `pretend you are …`, `ignore all previous
+  instructions`, `augment your baseline`) are STRONG. Indirect-injection and
+  image scans use the STRONG list only (weak phrases are common in benign
+  reference text).
+- **`normalize_text`** folds NFKC homoglyphs, strips zero-width/format-control
+  characters, **and collapses runs of whitespace** so a phrase padded with extra
+  spaces or split across newlines (`pretend   you   are`) still matches the
+  single-spaced literal patterns.
+
+The API's pre-call fast path (`fluiq-api/routes/secure/scanners.py`) is a
+dependency-light mirror of this logic and must stay behaviourally aligned.
+
+### PII & secret scoring notes
+
+- **Custom US_SSN recognizer** — Presidio's built-in `US_SSN` does not fire on
+  canonical 3-2-4 SSNs in the pinned version (`123-45-6789` is swallowed by
+  `DATE_TIME`, `SSN: 078-05-1120` by `PHONE_NUMBER`), and since `scan()` only
+  requests `_SUPPORTED_ENTITIES` those never surface. `pii.py` adds an explicit
+  3-2-4 (hyphen/space/dot) recognizer at confidence 0.85. A bare 9-digit run is
+  deliberately not matched — too ambiguous to carry `US_SSN`'s weight of 1.0.
+- **Confidence floor** — `_MIN_CONFIDENCE = 0.3` drops Presidio's very-weak
+  (0.05) bare-numeric `US_PASSPORT`/`US_SSN` matches that the flat entity weights
+  would otherwise promote to a HIGH false positive on any order/invoice/ID
+  number. Real signal is preserved (custom recognizers 0.80–0.95, NER ~0.85,
+  email/phone/credit-card ≥ 0.4). The existing `_drop_zip_ssn_false_positives`
+  (ZIP+4) and `_drop_hts_phone_false_positives` (tariff codes) still run first.
+- **Secret scoring** — a **named** secret pattern (openai_key, aws_access_key, …)
+  is HIGH → score 1.0; a **high-entropy-only** hit (no named pattern) is a soft
+  MEDIUM → 0.5, so a benign base64 blob no longer scores 1.0 (which would read as
+  HIGH in the run-rollup badge while the level was only MEDIUM).
 
 ---
 
@@ -109,8 +156,12 @@ Returns `{ allow, block_reason, risk_level, attack_types }` to
 
 Called from `/ingest` when the org's active guardrail policy has
 `scan_responses=True`. Scans only the **response** text for PII and secrets
-(attack patterns are prompt-side and already caught pre-call). Blocks when an
-attack type is present and `security_risk_score ≥ 0.5`. Returns
+(attack patterns are prompt-side and already caught pre-call). Blocks only on a
+**concrete** detection — a recognized PII entity (`pii_entities_response`) or a
+**named** secret type (`secret_types`) — with `security_risk_score ≥ 0.5`. A
+high-entropy-only hit (`secrets_detected` true but no named `secret_types`) is
+too noisy to gate a live response on, so a benign long token / base64 blob in
+the output is no longer blocked. Returns
 `{ response_blocked, risk_level, attack_types, block_reason }`. Fails open.
 
 ---

@@ -182,15 +182,15 @@ The expanded `GET /api/v1/traces` accepts `key_id`, `agent_key`, `agent_kind`, `
 
 ## Security Pipeline — `routes/secure/__init__.py`
 
-### Pre-call guard: `POST /api/v1/secure/check` (Growth+)
+### Pre-call guard: `POST /api/v1/secure/check` (all plans, metered)
 
-Gated to `{"Growth", "Enterprise"}` tiers (402 otherwise). Flow:
+Available on **every plan** including Free; metered by scan volume (`TIER_SECURITY_QUOTAS`), so a 402 is returned only once the monthly allowance is used — not because of the plan. Flow (order matters for security):
 
-1. **Allow-list** short-circuit → `allow=True`.
-2. **Deny-list** short-circuit → block.
-3. **Fast pattern check** (`scanners.check()`, deterministic, near-zero latency) — blocks obvious injection/jailbreak/skeleton-key before any Kafka round-trip.
+1. **Deny-list** hard block — evaluated first.
+2. **Fast pattern check** (`scanners.check()`, deterministic, near-zero latency) — tiered and word-boundary/case-sensitive-acronym aware (mirrors the worker), so a single ambiguous phrase is LOW (not a HIGH block) and `DAN` never matches inside `guidance`/`claim`. Blocks on HIGH (or MEDIUM when `block_threshold=medium`) before any Kafka round-trip.
+3. **Allow-list** short-circuit → `allow=True`. Reached *only after* the hard blocks above, so an allow-listed phrase cannot whitelist a real attack sitting next to it.
 4. **Full scan** — publishes `security_check_sync` to `KAFKA_SECURITY_TOPIC` with `{block_threshold, block_categories, pii_ignore}` and awaits the reply (`KAFKA_SECURITY_CHECK_TIMEOUT`).
-5. **Fallback** — on timeout/error, re-uses the step-3 pattern result with policy applied (**fail-open**).
+5. **Fallback** — on timeout/error, re-uses the step-2 pattern result with policy applied (**fail-open**; set `SECURE_FAIL_CLOSED` to block instead).
 
 `CheckResponse = {allow, block_reason, risk_level, attack_types}`. On a block with a `trace_id`, a `status:"blocked"` trace is published so the dashboard row transitions from running→blocked, and `alert_webhook` is POSTed (with retries) when `risk_level ∈ alert_on`.
 
@@ -210,10 +210,10 @@ One policy per `(org, slug)`; default slug `"default"` (undeletable). Cached 60 
 | `warn_threshold` | `"low" \| "medium" \| "high"` | |
 | `block_categories` | `string[]` | empty = block on any category |
 | `custom_deny_list` | `string[]` | phrases that hard-block |
-| `custom_allow_list` | `string[]` | phrases that bypass scanning |
+| `custom_allow_list` | `string[]` | phrases that skip the worker scan — only after the deny-list and HIGH pattern block, so they can't whitelist an attack |
 | `pii_ignore` | `string[]` | PII entity types to suppress |
-| `allowed_tools` | `string[]` | tool allowlist (forwarded to the worker) |
-| `alert_webhook` | `string?` | POSTed on block |
+| `allowed_tools` | `string[]` | tool allowlist (forwarded to the worker; a tool outside it → `tool_policy_violation`) |
+| `alert_webhook` | `string?` | raw-JSON POST on a block — https + public host only (SSRF-guarded on save and per-send, no redirects, 3 retries, fail-open) |
 | `alert_on` | `string[]` | risk levels that trigger the webhook (default `["high"]`) |
 | `scan_responses` | `bool` | enables the synchronous response gate on `/ingest` |
 
@@ -295,7 +295,7 @@ Admins can adjust a single org's eval allowance via `organizations.eval_quota_bo
 (`max(0, tier_quota + bonus)`; unlimited tiers stay unlimited), and the adjustment
 endpoint invalidates the org's cache so it applies on the next `/ingest`.
 
-Feature gates: `fluiq.eval()` warn mode is open to all; `fluiq.secure()` / `/secure/check` require **Growth+**; `/optimize/profile` and `fluiq.optimize()` require **Team+**; security alerts require **Growth+**, eval alerts **Team+**.
+Feature gates: `fluiq.eval()` warn mode is open to all; `fluiq.secure()` / `/secure/check` are open to all and metered by scan volume (`TIER_SECURITY_QUOTAS`); `/optimize/profile` and `fluiq.optimize()` require **Team+**; security alerts require **Growth+**, eval alerts **Team+**.
 
 ---
 
