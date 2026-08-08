@@ -215,6 +215,22 @@ deploy → wait for stability) against its own ECR repo / ECS service. Push to
 redeploy one. See `docs/workers.md` for shared topics/auth, and
 `docs/tracer.md` / `docs/evaluator.md` / `docs/security.md` for per-worker env vars.
 
+### Security worker — model weights are baked into the image
+
+Three models are downloaded at **build** time, not first use: two
+sentence-transformer encoders (~90MB and ~470MB) and the DeBERTa injection
+classifier (~740MB on disk, ~440MB resident). Fetching them lazily put a
+multi-hundred-MB download inside the request path, so a cold task looked like a
+hang rather than a slow start.
+
+Consequences to expect:
+
+- The ECR build is noticeably slower than the other workers'.
+- Task RSS is ~2150MB against the service's 4096MB limit. Headroom is real but
+  no longer generous; check it before adding another model.
+- `FLUIQ_CLASSIFIER_ENABLED=0` and `FLUIQ_SEMANTIC_BLOCKS=0` turn the two
+  heaviest layers off without a deploy. Every layer fails open.
+
 ---
 
 ## <a id="infrager"></a>Infrager

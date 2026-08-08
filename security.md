@@ -3,9 +3,16 @@
 The **Security** worker (`fluiq-workers/security/`) is an async Kafka consumer
 that scans traces for PII, secrets, and the full agentic-threat surface. It is
 deployed **separately** from the evaluator so its heavy dependencies (torch +
-spaCy/Presidio + sentence-transformers) don't bloat the evaluator's memory
-footprint or block judge calls. Shared worker concerns (running, Kafka topics,
-auth, producer settings, overall message flow) live in `docs/workers.md`.
+spaCy/Presidio + sentence-transformers + a DeBERTa classifier) don't bloat the
+evaluator's memory footprint or block judge calls. Shared worker concerns
+(running, Kafka topics, auth, producer settings, overall message flow) live in
+`docs/workers.md`.
+
+Every recall / false-alarm figure quoted here comes from the guardrail benchmark
+(`D:/ideas/FluiqAI/guardrail-bench`, published at `getfluiq.com/benchmark`), which
+measures this worker against LLM Guard, Presidio, NeMo, AWS Comprehend, Lakera
+and Nightfall on four corpora. Numbers are dated; re-run `make_report.py` before
+quoting them anywhere.
 
 ---
 
@@ -42,7 +49,9 @@ single executor thread (torch/spaCy memory control). Routes on `operation`:
 | `jailbreak.py` | Jailbreak / role-play escapes (tiered strong/weak) |
 | `skeleton_key.py` | Skeleton-key attack patterns (Microsoft KB; tiered strong/weak) |
 | `secrets.py` | Hardcoded credentials / high-entropy tokens |
-| `semantic.py` | Cosine-similarity attack classifier (sentence-transformers) |
+| `semantic_v2.py` | Two-scope centroid similarity, the shipping semantic layer (`semantic_verdict`) |
+| `semantic.py` | The older single-scope scorer. Still used for **retrieved documents only** (RAG poisoning), which are scored on a different distribution against `_RAG_POISON_THRESHOLD` and were not part of the v2 calibration |
+| `classifier.py` | Fine-tuned DeBERTa injection classifier, advisory by default |
 | `image_scan.py` | OCR of image media → text scanned for injection (pluggable, fail-open) |
 | `openinference.py` | Normalizes raw OpenInference spans → scannable fields (fallback) |
 | `scanners.py` | Orchestrator — `scan()` (full post-call) and `check()` (pre-call patterns only) |
@@ -73,7 +82,106 @@ model in `base.py`:
   single-spaced literal patterns.
 
 The API's pre-call fast path (`fluiq-api/routes/secure/scanners.py`) is a
-dependency-light mirror of this logic and must stay behaviourally aligned.
+dependency-light mirror of **the pattern layer only**. It has no semantic layer
+and no classifier, so it scores materially lower than the worker gate on the
+same input (13.3% vs 35.3% recall on public injection data). It is a fast path,
+not a second implementation of the gate — see "Three detection layers" below.
+
+### Three detection layers
+
+Prompt-side detection is three independent signals, in increasing cost:
+
+| Layer | Module | Cost | Blocks? |
+|-------|--------|------|---------|
+| Patterns | `injection/jailbreak/skeleton_key.py` | microseconds | yes |
+| Semantic | `semantic_v2.py` | sub-millisecond | yes (`FLUIQ_SEMANTIC_BLOCKS=0` to disable) |
+| Classifier | `classifier.py` | ~460ms | **no**, advisory by default |
+
+**Semantic (`semantic_v2.py`)** scores a prompt against seed centroids in two
+scopes, each with its own model and its own threshold:
+
+| Scope | Model | Threshold | Why |
+|-------|-------|-----------|-----|
+| injection | `paraphrase-multilingual-MiniLM-L12-v2` | 0.41 | roughly a third of real injection traffic is not English |
+| jailbreak | `all-MiniLM-L6-v2` | 0.46 | the jailbreak corpus is English-only and the monolingual model is stronger per-language |
+
+Both models are baked into the image (see the Dockerfile) rather than fetched
+lazily, so a cold task does not put a several-hundred-MB download inside the
+first message after a deploy.
+
+The thresholds were calibrated **jointly**, on the combined dev set of both
+corpora, to a 5% total false-alarm budget. Tuning them independently is wrong
+and was the original bug: both scopes score all traffic, so isolated tuning
+produced 30% real false alarms against the 6% each scope promised on its own.
+
+Two behaviours that used to make this layer dead code, both fixed:
+
+- **The `0.65` gates are gone.** Four of them sat above the useful operating
+  range (0.15–0.44 measured on public corpora), so the layer almost never fired
+  and patterns carried the entire load. The fourth lived in `run.py` and
+  re-derived `semantic_attack` from a constant that disagreed with the gate that
+  actually ran, so a scan could flag a prompt while the reported attack types
+  stayed silent.
+- **A semantic hit is HIGH, not MEDIUM.** `should_block` is `overall == HIGH`
+  and `allow` is `overall != HIGH`, so a MEDIUM semantic verdict could never
+  block however confident it was. Promoting it takes combined recall from 30.0%
+  to 58.8% at a 4.2% false-alarm rate (patterns alone: 2.6%).
+
+**Classifier (`classifier.py`)** is `protectai/deberta-v3-base-prompt-injection-v2`
+at threshold 0.90, windowed (1200 chars, 900 stride, 8 windows max) so an
+injection buried at the end of a long benign wall of text is not truncated away.
+
+It runs in `scan()` and **never** in `check()`: a DeBERTa forward pass is ~460ms
+against sub-millisecond for the embedding scopes, and `check()` is the
+synchronous pre-call gate a caller waits on.
+
+It is advisory because it keys on the imperative verb rather than on what the
+verb targets. On public corpora it looks free (jailbreak 55% → 80%, injection
+35% → 53%, no measurable false-alarm change), but against the false-positive
+regression cases, which look far more like real support traffic, it flags 6 of
+16 benign prompts at p > 0.99:
+
+```
+0.9998  "Ignore the formatting of the attached file and just read the text."
+1.0000  "Please disregard my previous message, I sent it by mistake."
+0.9975  "You are no longer subscribed."
+```
+
+No threshold separates those from real attacks, and requiring pattern
+corroboration buys exactly zero extra recall because the pattern layer had
+already fired on anything it would corroborate.
+
+> **Known gap.** `classifier_score` is computed and set on `ScanResult`, but it
+> is **not persisted** — it is absent from the ClickHouse insert, from the
+> `run.py` record dicts, and from `extra`. The stated reason for running the
+> model in advisory mode is to accumulate labelled disagreements with the
+> shipping gate as training data, and that is not currently happening. Adding a
+> `classifier_score` column (plus the `ALTER TABLE`, ordered before the worker
+> deploy) is what closes it.
+
+**Environment kill switches**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FLUIQ_SEMANTIC_BLOCKS` | `1` | `0` demotes a semantic hit to MEDIUM (advisory) while still reporting the score |
+| `FLUIQ_SEMANTIC_MODEL_INJECTION` / `_JAILBREAK` | see table | swap either encoder |
+| `FLUIQ_SEMANTIC_THRESHOLD_INJECTION` / `_JAILBREAK` | `0.41` / `0.46` | retune without a deploy |
+| `FLUIQ_CLASSIFIER_ENABLED` | `1` | `0` turns the classifier off entirely |
+| `FLUIQ_CLASSIFIER_MODE` | `advisory` | `block` lets it contribute to the verdict |
+| `FLUIQ_CLASSIFIER_MODEL` | `protectai/deberta-v3-base-prompt-injection-v2` | `-small-` is the cheaper variant |
+| `FLUIQ_CLASSIFIER_THRESHOLD` | `0.90` | |
+
+Every layer fails open. A missing model, a failed import or an inference error
+scores 0.0 and the gate falls back to the layers that did load.
+
+**Regression tests.** `tests/test_pattern_tiering.py` imports only the pattern
+helpers, so it cannot see semantic regressions at all.
+`tests/test_semantic_gate.py` exercises the assembled gate end to end against the
+same fixtures and is the test that catches a threshold change turning benign
+support traffic into blocks.
+
+**Measured cost.** After the classifier landed: `check()` 59ms, `scan()` 462ms,
+RSS 2150MB against the task's 4096MB limit.
 
 ### PII & secret scoring notes
 
@@ -123,7 +231,8 @@ trace tree (all keyed on `root_trace_id`), and OCRs any image media:
 | Tool allowlist (B.3) | `tool_policy_violation_detected/tool_policy_violations` — tool called outside the org `allowed_tools` |
 | Cross-agent injection (C.1) | `cross_agent_injection_detected` — attack content arriving from another agent's output |
 | Image-embedded injection | `image_injection_detected`, `image_injection_sources` — OCR of the event's image media (`image_scan.py`), then the OCR'd text run through the same injection/jailbreak/skeleton scanners. OCR backend is pluggable + fail-open (pytesseract → easyocr → none); only URL-source media is scannable from the trace |
-| Semantic | `semantic_attack_score` |
+| Semantic | `semantic_attack_score` — the winning scope's score from `semantic_verdict()` |
+| Classifier | `classifier_score` — advisory, set on the result but not persisted (see the gap note above) |
 | Aggregate | `security_risk_level`, `security_risk_score`, `should_block` |
 
 Two trajectory signals are derived in `run.py` and stored in the `extra` column:
@@ -183,8 +292,15 @@ tool_policy_violation_detected, tool_policy_violations,
 cross_agent_injection_detected,
 image_injection_detected, image_injection_sources,
 semantic_attack_score, security_risk_level, security_risk_score,
-should_block, scan_latency, extra
+should_block, scan_latency, extra, retention_days
 ```
+
+`retention_days` mirrors the per-row TTL on `traces` (free tier rolls at 14 days,
+paid never). It defaults to the `36500` "never" sentinel when the ingest path did
+not forward one, so a scan is never dropped early by a missing value.
+
+`classifier_score` is **not** in this list — see the gap note under "Three
+detection layers".
 
 `extra` (JSON) carries the derived trajectory signals: `crescendo_detected`,
 `crescendo_score`, `session_turns`, `trust_boundary_escalation`,

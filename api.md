@@ -419,6 +419,50 @@ Flow (order matters for security): **deny-list** (hard block) → **fast pattern
 
 When `allow: false` the SDK raises `FluiqSecurityError` and the LLM call is never made; a `status:"blocked"` trace is published (dashboard row → blocked) and the policy's `alert_webhook` is fired when `risk_level ∈ alert_on`. When the scan service is unreachable the endpoint returns the pattern-only verdict (fail-open).
 
+> The fast pattern check is the **pattern layer only**. It has no semantic layer
+> and no classifier, so it detects materially less than the worker's full gate
+> (13.3% vs 35.3% recall on public injection data). That is the latency tradeoff
+> of a synchronous pre-call path, not a bug, but it is why the `/secure/check`
+> flow escalates to the worker rather than answering from the fast path alone.
+> See `docs/security.md` § "Three detection layers".
+
+---
+
+## Demo (public, unauthenticated)
+
+`routes/demo/` backs the free `/response-gate-demo` page. **No auth, no API key,
+no LLM call, and therefore no per-request cost.** Model responses are real
+transcripts captured once from `claude-haiku-4-5` and committed to
+`transcripts.json`; what runs on every request is the genuine gate
+(`routes.secure.scanners.check` on the input, `routes.demo.output_scan` on the
+response). Nothing is mocked.
+
+Because there is no per-request cost the guards are light and fail **open**: a
+per-IP hourly ceiling (`DEMO_PER_IP_HOURLY`, default 120) via Redis, and an input
+cap (`DEMO_MAX_INPUT_CHARS`, default 20000). An earlier draft called the model
+live and had to fail closed; removing the cost removed that constraint.
+
+### GET `/api/v1/demo/scenarios`
+
+Recorded scenarios with the gate verdict already computed for each.
+
+### POST `/api/v1/demo/scan`
+
+Runs the real gate over text the visitor supplies.
+
+```json
+{ "prompt": "...", "response": "..." }
+```
+
+`output_scan.py` is deliberately dependency-free (no Presidio, no spaCy) so it
+runs inline in the API. It detects planted canaries, credentials, and PII, with
+card numbers confirmed by Luhn so ordinary 16-digit order numbers do not trip it.
+
+> **Transcripts are model-pinned and will go stale.** They were recorded against
+> Haiku 4.5, which refuses nearly every attack outright. The demo's actual
+> finding is that the leak is the PII inside the refusal, not a compliant answer,
+> and that framing depends on the recorded model's behaviour.
+
 ---
 
 ## Guardrails

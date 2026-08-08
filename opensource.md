@@ -4,22 +4,23 @@ Two standalone products ship under the FluiqAI name: **polygate** and
 **Infrager**. Both are MIT licensed, free, and usable without a Fluiq account.
 Neither is monetized. They exist to reach developers earlier in their workflow
 than an observability platform can, and to make the engineering behind Fluiq
-inspectable.
+inspectable. A third repository, **guardrail-bench**, is written to be published
+on the same terms but has no remote yet.
 
 This document covers what they are, how they are built, and how to operate them.
 Deployment specifics for Infrager's shared AWS resources live in
 [`deployments.md`](./deployments.md#infrager); the strategic rationale is in
 [`business_plan.md`](./business_plan.md) §4.4.
 
-| | polygate | Infrager |
-|---|---|---|
-| What | Unified LLM client across four providers | Cloud architecture diagrams compiled to Terraform, with security linting |
-| Repo | `SaurabhKumbhar24/polygate` | `SaurabhKumbhar24/Infrager` |
-| Local | `D:\ideas\FluiqAI\polygate` | `D:\ideas\FluiqAI\Infrager\infrager` |
-| Site | `polygate.getfluiq.com` | `infrager.getfluiq.com` |
-| Ships as | PyPI `polygate` + npm `polygate`, both `0.2.0` | Hosted web app |
-| Backend | None (client library) | Express + Postgres on ECS |
-| License | MIT | MIT |
+| | polygate | Infrager | guardrail-bench |
+|---|---|---|---|
+| What | Unified LLM client across four providers | Cloud architecture diagrams compiled to Terraform, with security linting | Guardrail benchmark harness, corpora and adapters |
+| Repo | `SaurabhKumbhar24/polygate` | `SaurabhKumbhar24/Infrager` | **none yet** (local git only) |
+| Local | `D:\ideas\FluiqAI\polygate` | `D:\ideas\FluiqAI\Infrager\infrager` | `D:\ideas\FluiqAI\guardrail-bench` |
+| Site | `polygate.getfluiq.com` | `infrager.getfluiq.com` | results at `getfluiq.com/benchmark` |
+| Ships as | PyPI `polygate` + npm `polygate`, both `0.2.0` | Hosted web app | Nothing yet |
+| Backend | None (client library) | Express + Postgres on ECS | None (a script) |
+| License | MIT | MIT | MIT intended |
 
 ---
 
@@ -251,16 +252,75 @@ manual image-release steps, is documented in
 
 ---
 
+## guardrail-bench
+
+### What it is
+
+A harness that asks every guardrail the same question about the same string:
+block, or allow. It scores recall, false-alarm rate and F1 across four corpora
+and publishes every miss and every false alarm by case ID.
+
+Contestants: Fluiq, LLM Guard, Presidio, NeMo Guardrails, AWS Comprehend,
+Lakera Guard, Nightfall, and a thirty-line regex control that exists so it is
+visible whenever a sophisticated product barely beats it.
+
+Corpora: a hand-written output-leakage suite, a sample of
+`ai4privacy/pii-masking-200k`, `deepset/prompt-injections`, and
+`jackhhao/jailbreak-classification`. 949 cases in total. The two hand-built
+corpora are ours; the other two are public sets nobody here curated.
+
+### How it is run
+
+```
+python run.py --corpus <corpus>.jsonl --json results_<name>.json
+python make_report.py      # REPORT.md + report.html + the website's JSON
+chrome --headless --print-to-pdf=... report.html
+```
+
+`make_report.py` is the single source of truth. It writes `REPORT.md`,
+`report.html` and `fluiq-frontend/src/lib/benchmarkData.json` in one pass, so the
+report, the PDF and `/benchmark` cannot disagree. Adding a guardrail means
+implementing one method, `scan(text) -> Verdict`.
+
+### Rules that make the numbers worth anything
+
+- **Scoring was fixed before any contestant ran**, and competitors run at stock
+  settings with nothing tuned to these cases.
+- **A contestant whose library or credentials are missing is skipped and
+  reported, never scored zero.** Nightfall's first run errored on 190 of 300
+  cases through rate limiting; those results were discarded, backoff was added,
+  and the harness now refuses to rank anything erroring on more than 2% of a
+  corpus.
+- **Every number is dated.** Guardrails change underneath you, and a result
+  without a date is worthless.
+- **We do not place first on either output-side corpus**, and the page says so.
+
+### Before this can be published
+
+- **Credentials.** Lakera and Nightfall keys live in `guardrail-bench/.env`,
+  which is gitignored and has never been staged. Confirm that before adding a
+  remote.
+- **Customer data must not leak into the corpus.** ClickHouse prompts from two
+  orgs were used for internal threshold calibration only. They are not in any
+  published corpus and must stay out of one.
+- **`ai4privacy/pii-masking-200k` states no licence** on its dataset card. We
+  sample from it and publish derived results; redistributing the corpus itself
+  needs its terms resolved first. The other two public sets are Apache-2.0.
+
+---
+
 ## Shared conventions
 
-Both products follow the FluiqAI design system (`DESIGN.md`): warm-paper and ink
+All three follow the FluiqAI design system (`DESIGN.md`): warm-paper and ink
 with a single cobalt signal, Figtree and JetBrains Mono, hugeicons rather than
 phosphor, and class-based dark mode matching the `ThemeContext` pattern in
 `fluiq-frontend`.
 
-Both are surfaced on `getfluiq.com` through the Developer nav dropdown, the
-footer's Open Source column, and the sitemap. Infrager additionally has a
-landing page at `/infrager` and a section on the homepage.
+polygate and Infrager are surfaced on `getfluiq.com` through the Resources nav
+dropdown (Tools column), the footer's Open Source column, and the sitemap.
+Infrager additionally has a landing page at `/infrager` and a section on the
+homepage. guardrail-bench is surfaced only through its results page,
+`/benchmark`, listed under Resources → Learn.
 
 Neither product has an attribution path back to Fluiq signups today. Referral
 traffic is the only signal, so any claim about their contribution to the funnel

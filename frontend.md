@@ -36,6 +36,9 @@ src/
 │   ├── *-alternative/        # comparison pages (langfuse, langsmith, helicone,
 │   │                         #   braintrust, lakera, portkey)
 │   ├── llm-cost-calculator/  # tool page (uses /models)
+│   ├── response-gate-demo/   # free tool — recorded fluiq.secure(mode="block")
+│   │                         #   transcripts, zero inference cost (see below)
+│   ├── benchmark/            # guardrail benchmark results (see below)
 │   ├── infrager/             # landing page for Infrager (separate OSS product,
 │   │                         #   app lives at infrager.getfluiq.com)
 │   ├── admin/
@@ -49,6 +52,65 @@ src/
 │   ├── Infrager.tsx          # /infrager landing page
 ├── components/ contexts/ lib/ store/ styles/ assets/
 ```
+
+### Free tool pages
+
+Two public pages exist to be linked to rather than to sell, both under
+`src/screens/Tools/`.
+
+**`/response-gate-demo`** (`ResponseGateDemo.tsx`) replays recorded
+`fluiq.secure(mode="block")` transcripts from `fluiq-api/routes/demo/transcripts.json`
+via `POST /demo/output-scan`. It runs no inference, so the page costs nothing per
+visit. The transcripts are **pinned to a specific model** and will go stale: they
+were recorded against Haiku 4.5, which refuses nearly every attack outright, so
+the page's actual finding is that the leak is the PII inside the refusal rather
+than a compliant answer.
+
+**`/benchmark`** (`Benchmark.tsx`) renders entirely from
+`src/lib/benchmarkData.json`, which is **generated**, not hand-written:
+`guardrail-bench/make_report.py` writes `REPORT.md`, `report.html` and that JSON
+in one pass, so the page, the report and
+`public/Fluiq-Guardrail-Benchmark.pdf` cannot drift apart. Editing the JSON by
+hand is always wrong; re-run the generator.
+
+Conventions worth keeping when touching the page:
+
+- **One row per product.** Competitors appear once, so Fluiq does too. Secondary
+  configurations (the API fast path, the demo's inline scanner) score lower and
+  are published in a footnote and a PDF appendix rather than dropped.
+- **Bar widths are inline styles, never animations.** A scroll-triggered width
+  that fails to fire leaves the bar at zero, which misreports a score rather
+  than just missing an effect.
+- **Recall and false alarm get a panel each.** Both run 0–100% but point in
+  opposite directions; on a shared axis the taller bar reads as the better
+  product. Fluiq is `#1860D3` (`#6FA8FF` dark), every competitor is the same
+  neutral grey, and the product name is on every row so colour never carries
+  identity alone.
+- **The run date is displayed and comes from `data.generated`**, in the hero, on
+  each corpus's source line, and in the Dataset JSON-LD (`datePublished` /
+  `dateModified`). Formatted without `toLocaleDateString`, whose output depends
+  on the runtime locale and would differ between the server render and the
+  browser.
+- **Vendor logos are wired but empty.** `LOGOS` in `Benchmark.tsx` maps a slug to
+  `public/logos/<slug>.svg`; every unmapped row falls back to a neutral
+  monogram. Competitors' trademarks are deliberately not vendored into the repo.
+  `make_report.py` reads the same slug from `guardrail-bench/logos/`.
+
+### Navigation
+
+`SiteNavbar` composes three hover dropdowns: `NavPlatformDropdown`,
+`NavIntegrationsDropdown` and `NavDeveloperDropdown` ("Resources"). Resources is
+a three-column mega menu driven by `NAV_GROUPS`:
+
+| Column | Items |
+|--------|-------|
+| Learn | Blogs, FAQ, Guardrail Benchmark |
+| Build | Fluiq Docs, Code Samples |
+| Tools | Response Gate Demo, LLM Cost Calculator, polygate, Infrager |
+
+The panel is 880px wide because at 720px every description wrapped to two lines,
+which doubled the row height and made three short columns read as one tall
+block. There is no mobile variant — the whole nav is desktop-only.
 
 ### Dashboard routes — `src/app/dashboard/`
 
