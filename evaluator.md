@@ -117,6 +117,45 @@ Each evaluator subclasses `BaseEvaluator` and returns an `EvalResult`
 
 ---
 
+### How judges are asked to score
+
+Every scalar metric asks the judge for an **integer 1-5 against a written rubric
+line per point**, and the mapping onto 0..1 happens in Python
+(`base.judge_score` -> `likert_to_unit`): 1 -> 0.00, 2 -> 0.25, 3 -> 0.50,
+4 -> 0.75, 5 -> 1.00.
+
+The model never emits the float. Choosing one of five labelled options is a
+classification task an LLM does reliably; producing a calibrated real number is
+not, and a free 0..1 float clusters hard around 0.7-0.9 — which is exactly where
+the default pass threshold sits, so a trivial reword could flip a verdict. Every
+published judge framework uses a discrete scale for the same reason (Prometheus
+1-5, MT-Bench 1-10).
+
+Two conventions go with it, and both are enforced by tests rather than left to
+habit (`tests/test_prompt_mirror_sync.py`):
+
+- **Reasoning is requested before the verdict.** Models emit JSON keys in the
+  order you ask for them, so a `{"score": ..., "reason": ...}` schema produces a
+  rationalisation of a number the model already committed to. Every prompt asks
+  for its verdicts and reason first, then the rating.
+- **Each of the five points carries its own rubric line.** "0 = bad, 1 = good"
+  leaves the middle undefined, so it drifts between calls and between models —
+  which also means panel disagreement is partly *scale* disagreement rather than
+  genuine disagreement about the answer.
+
+Scores that are genuinely fractions are **not** rated: `goal_completion` is the
+share of sub-goals achieved, retrieval relevance is rank-weighted precision, and
+tool-selection can be derived from per-call verdicts. Those are computed, not
+judged, and stay continuous.
+
+`judge_score()` still accepts a legacy `{"score": float}`. That is not
+politeness: an org that edited its prompt keeps that template permanently,
+because the seeder never overwrites a row with `is_overridden` set, and those
+judges still answer with a float. Dropping the fallback would silently zero
+every overridden judge in production.
+
+---
+
 ## 3. Single-shot metrics
 
 These score a single `(question, answer, [context])` triple. Used by
