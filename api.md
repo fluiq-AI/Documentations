@@ -356,43 +356,6 @@ An "agent" is a trace **root** keyed by its `@trace` function name (or chain /
 
 ---
 
-## Optimize
-
-### GET `/api/v1/optimize/cache-stats`
-Redis cache hit/miss aggregated from SDK traces (JWT auth). Query: `window_hours` (1–720, default 24).
-```json
-{ "window_hours": 24, "hits": 842, "misses": 301, "calls": 1143, "hit_rate": 0.737,
-  "per_kind": [ { "kind": "mcp_call", "hits": 210, "misses": 40, "calls": 250, "hit_rate": 0.84 } ] }
-```
-`per_kind` covers: `llm`, `embedding`, `vectorstore`, `function`, `mcp_call`, `mcp_list_tools`.
-
-### GET `/api/v1/optimize/prompt-cache-stats`
-Provider prefix-cache token counts (JWT auth). Query: `window_hours`.
-```json
-{ "window_hours": 24, "anthropic_cache_read_tokens": 184200, "anthropic_cache_creation_tokens": 21000,
-  "provider_cached_tokens": 64800, "total_cached_tokens": 249000, "calls": 1840, "calls_with_hit": 1210 }
-```
-
-### GET `/api/v1/optimize/profile`
-SDK endpoint — Redis cache profile for the calling org. API key auth. **Requires Team plan or above.**
-```json
-{ "redis_url": "redis://...", "key_prefix": "fluiq:abc12345:", "models": ["gpt-4o", "claude-sonnet-4-6"],
-  "ttl_seconds": 86400, "estimated_hit_rate": 0.42, "window_hours": 168 }
-```
-**Errors** · `402` Free plan · `503` Redis not configured.
-
-### GET `/api/v1/optimize/cache/{key}` · POST `/api/v1/optimize/cache`
-SDK Redis proxy (API key). GET → `{ "value": ... }` or `404` miss. POST `{ key, value, ttl }` → `204` (fire-and-forget).
-
-### GET `/api/v1/optimize/evals`
-CI eval gate (API key). Query: `window_minutes` (def 30), `threshold` (def 0.7), `limit` (def 200).
-```json
-{ "window_minutes": 30, "total": 45, "passed": 40, "failed": 5, "avg_score": 0.883,
-  "entries": [{ "trace_id": "uuid", "metric": "hallucination", "score": 0.91, "evaluator": "fluiq.eval", "judge_model": "claude-haiku-4-5-20251001" }] }
-```
-
----
-
 ## Security
 
 ### POST `/api/v1/secure/check`
@@ -661,6 +624,13 @@ failing a run. `jury` applies only at `depth: "deep"`, where a panel is convened
 With a saved provider credential the selected provider's key is the org's own, so
 judge tokens bill to their account (see **Provider credentials** above).
 **Response** `200 OK` `{ "ok": true, "trace_id": "uuid", "status": "queued", "events": 7 }` · `status:"skipped"` when eval quota is exceeded. **Errors** · `404` no trace events · `422` invalid id.
+
+### GET `/api/v1/evaluate/recent-evals`
+CI eval gate (API key auth — no login, safe for CI). Query: `window_minutes` (def 30), `threshold` (def 0.7), `limit` (def 200). No tier gate. *Moved here from `/api/v1/optimize/evals` when the optimization pillar was removed.*
+```json
+{ "window_minutes": 30, "total": 45, "passed": 40, "failed": 5, "avg_score": 0.883,
+  "entries": [{ "trace_id": "uuid", "metric": "hallucination", "score": 0.91, "evaluator": "fluiq.eval", "judge_model": "claude-haiku-4-5-20251001" }] }
+```
 
 ### GET `/api/v1/evaluate/agentic-summary?window_hours=24`
 JWT-authed. Aggregates agentic-eval health for the Overview tile over a window (1..720h): run count, run pass-rate, avg run score, and per-layer average scores.

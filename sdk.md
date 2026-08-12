@@ -6,7 +6,7 @@ pip install fluiq
 
 Requires Python ≥ 3.9.
 
-The Python SDK (`fluiq-sdk/`) is a **thin, fail-open instrumentation client**. It auto-patches your LLM/agent/vectorstore libraries to emit traces, and exposes a few opt-in feature toggles (`optimize`, `eval`, `secure`). The heavy lifting — LLM-as-judge evaluation, security scanning, cache profiling — happens **server-side** in `fluiq-api` + `fluiq-workers`; the SDK only sends events and, for block-mode features, makes one synchronous call. Every instrumentation path is wrapped so a Fluiq failure never breaks your app (no exceptions, no console noise) — the only exceptions it ever raises are the intentional `FluiqSecurityError` / `FluiqEvalError` block-mode guards.
+The Python SDK (`fluiq-sdk/`) is a **thin, fail-open instrumentation client**. It auto-patches your LLM/agent/vectorstore libraries to emit traces, and exposes two opt-in feature toggles (`eval`, `secure`). The heavy lifting — LLM-as-judge evaluation, security scanning — happens **server-side** in `fluiq-api` + `fluiq-workers`; the SDK only sends events and, for block-mode features, makes one synchronous call. Every instrumentation path is wrapped so a Fluiq failure never breaks your app (no exceptions, no console noise) — the only exceptions it ever raises are the intentional `FluiqSecurityError` / `FluiqEvalError` block-mode guards.
 
 > A TypeScript SDK (`fluiq-sdk-typescript/`, published as `@fluiq/sdk`) mirrors this surface.
 
@@ -50,24 +50,13 @@ def run_pipeline(query: str) -> str: ...
 async def async_step(x): ...
 ```
 
-Emits a `status="running"` event at entry (for live UI) and a `status="success"`/`"error"` event on completion, capturing `latency`, `success`, and the exception string on failure. When `fluiq.optimize()` is active, decorated function results may be served from / written to the Fluiq cache (and the event is flagged `_cache_hit`).
+Emits a `status="running"` event at entry (for live UI) and a `status="success"`/`"error"` event on completion, capturing `latency`, `success`, and the exception string on failure.
 
 ---
 
 ## Feature Toggles
 
-All three are opt-in, must be called **after** `instrument()`, and are no-ops until called.
-
-### `fluiq.optimize(mode="cache")` — trace-driven Redis caching *(Team plan+)*
-
-Fluiq analyses your historical traces to find frequently-repeated calls and provisions a dedicated Redis instance. On the first call after `optimize()`, the SDK fetches the cache profile from `/optimize/profile`, connects, and begins serving repeats from cache.
-
-```python
-fluiq.optimize()                 # "cache" — full caching
-fluiq.optimize(mode="observe")   # measure would-be hits without serving cached responses
-```
-
-Covers **LLM responses** (matched on `model, messages, system, tools`), **MCP** `list_tools`/`call_tool` results, and **provider prefix caching** (see below). Invalid mode raises `ValueError`.
+Both are opt-in, must be called **after** `instrument()`, and are no-ops until called.
 
 ### `fluiq.eval(thresholds=None, metrics=None, mode="warn", judge_model="claude-haiku-4-5-20251001", custom_judges=None)`
 
@@ -247,7 +236,7 @@ After `instrument()`, the following are auto-patched — no application code cha
 | Provider | Patched surface |
 |----------|-----------------|
 | OpenAI | `chat.completions.create`, responses API, `parse`, streaming, embeddings, images, audio (sync + async) |
-| Anthropic | `messages.create` + beta, streaming (sync + async); `cache_control` injection when `optimize()` is on |
+| Anthropic | `messages.create` + beta, streaming (sync + async) |
 | Google Gemini / Vertex AI | `generate_content`, streaming, `count_tokens`, embeddings (sync + async) |
 | LangChain | callback handler injected via configure hook — chains, tools, retrievers |
 | LangGraph | auto-detected from LangChain metadata (`langgraph_node`, `langgraph_step`) |
@@ -259,15 +248,20 @@ After `instrument()`, the following are auto-patched — no application code cha
 
 ---
 
-## Optimize Internals — provider prefix caching
+## Provider prefix-cache token capture
 
-When `fluiq.optimize()` is active, in addition to the Redis response/MCP cache the SDK enables provider-level prefix caching and surfaces cached token counts (all three feed the Optimize dashboard's **Prompt Caching** card via `/optimize/prompt-cache-stats`):
+Providers cache long prompt prefixes on their own side and bill those tokens at a
+discount. The SDK captures those counts so reported cost matches the provider bill.
+This is observability, not a Fluiq caching product — the SDK injects nothing and
+serves nothing from a cache.
 
-- **Anthropic** — injects `cache_control: {"type": "ephemeral"}` onto the system prompt and the last tool definition. Captures `usage.cache_read_input_tokens` (`prompt_cache_read_tokens`, billed ~10%) and `usage.cache_creation_input_tokens` (`prompt_cache_creation_tokens`, billed ~125%).
+- **Anthropic** — captures `usage.cache_read_input_tokens` (`prompt_cache_read_tokens`, billed ~10%) and `usage.cache_creation_input_tokens` (`prompt_cache_creation_tokens`, billed ~125%).
 - **OpenAI** — automatic for prompts ≥ 1024 tokens. Captures `usage.prompt_tokens_details.cached_tokens` (`prompt_cached_tokens`).
-- **Gemini** — user-managed `CachedContent`; the SDK injects nothing but captures `usage_metadata.cached_content_token_count` (`prompt_cached_tokens`).
+- **Gemini** — user-managed `CachedContent`. Captures `usage_metadata.cached_content_token_count` (`prompt_cached_tokens`).
 
-The Redis cache primitives live in `src/fluiq/optimization/caching/` (`BaseCache`, `make_key`, `RedisCache`) and the cache client in `src/fluiq/optimization/client.py`. These are internal to `optimize()` — there is no public in-SDK caching/reranking/RAG toolkit; that functionality is now server-orchestrated.
+There is no in-SDK caching, reranking, or RAG toolkit. The optimization pillar and
+its trace-driven Redis cache were removed; Fluiq stands on three pillars — secure,
+observe, evaluate — with dataset and prompt management inside evaluation.
 
 ---
 
@@ -279,7 +273,7 @@ VERSION  = "v1"
 # auth_headers() → {"Authorization": "Bearer <api_key>"}
 ```
 
-`_config` holds the live state: `api_key, endpoint, version, enabled`, and the per-feature flags (`optimize`/`optimize_mode`, `eval`/`eval_mode`/`eval_metrics`/`eval_thresholds`/`eval_judge_model`/`eval_custom_judges`, `secure`/`secure_mode`/`secure_guardrail`). All SDK → API requests carry the API key as an `Authorization: Bearer` header.
+`_config` holds the live state: `api_key, endpoint, version, enabled`, and the per-feature flags (`eval`/`eval_mode`/`eval_metrics`/`eval_thresholds`/`eval_judge_model`/`eval_custom_judges`, `secure`/`secure_mode`/`secure_guardrail`). All SDK → API requests carry the API key as an `Authorization: Bearer` header.
 
 ---
 

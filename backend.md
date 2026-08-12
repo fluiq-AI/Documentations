@@ -57,8 +57,7 @@ All routers are mounted in `main.py`. Dashboard routers use JWT (`get_current_se
 | `otel_router` | `/api/v1` | API key | `/ingest/otel` — import OpenInference/OTLP spans from Phoenix/Langfuse (push) or the LangSmith/Braintrust pull connectors (`connectors/`) |
 | `agents_router` | `/api/v1` | JWT | `/agents/summary` |
 | `quota_router` | `/api/v1` | JWT | `/quota` |
-| `evaluate_router` | `/api/v1` | JWT / API key | `/evaluate`, `/evaluate/agentic` (Run Agentic Eval — root traces), `/evaluate/agentic-summary`, `/evaluate/playground`, `/evaluate/compare` |
-| `optimize_router` | `/api/v1/optimize` | JWT or API key (per endpoint) | Cache stats, profile, Redis proxy, CI eval gate |
+| `evaluate_router` | `/api/v1` | JWT / API key | `/evaluate`, `/evaluate/agentic` (Run Agentic Eval — root traces), `/evaluate/agentic-summary`, `/evaluate/playground`, `/evaluate/compare`, `/evaluate/recent-evals` (CI eval gate) |
 | `secure_router` | `/api/v1` | API key | `/secure/check` (pre-call guard) |
 | `guardrails_router` | `/api/v1` | JWT | `/guardrails` CRUD + `/guardrails/list` |
 | `alerts_router` | `/api/v1` | JWT | `/alerts` get/save + `/alerts/test` |
@@ -117,16 +116,16 @@ Async client (`clickhouse-connect`), **self-hosted on AWS EC2** (cut over from C
 - `dataset_trajectory_spans` — `ReplacingMergeTree`, **no TTL**: the pinned whole-trajectory snapshot behind trace-backed dataset examples (one row per span, keyed by `org_id, root_trace_id, trace_id`); media offloaded to S3
 - `audit_log` — HMAC-signed request audit trail
 
-Key query methods: `fetch_traces()` (paginated, joins evals + security + costs), `get_root_rollups()` (batch per-run roll-ups for `/traces/rollups`), `count_traces()` / `count_evaluations()` (quota), `fetch_cache_stats()`, `fetch_prompt_cache_stats()`, `fetch_optimization_profile()`, `fetch_agent_summary()` (reads the roll-ups + denormalized `agent_key`), `get_dataset_trajectory()` / `insert_dataset_trajectory()`, `fetch_recent_evals()`, `fetch_agentic_summary()` (Overview agentic tile — per-layer pass-rate/score), plus spending rollups. The evaluator worker's own CH client adds `fetch_recent_trace_events()` for calibration harvesting.
+Key query methods: `fetch_traces()` (paginated, joins evals + security + costs), `get_root_rollups()` (batch per-run roll-ups for `/traces/rollups`), `count_traces()` / `count_evaluations()` (quota), `fetch_agent_summary()` (reads the roll-ups + denormalized `agent_key`), `get_dataset_trajectory()` / `insert_dataset_trajectory()`, `fetch_recent_evals()`, `fetch_agentic_summary()` (Overview agentic tile — per-layer pass-rate/score), plus spending rollups. The evaluator worker's own CH client adds `fetch_recent_trace_events()` for calibration harvesting.
 
 **Schema application:** `_apply_schema()` runs `db_queues/clickhouse/schema.sql` on API startup — idempotent `CREATE … IF NOT EXISTS` / `ALTER … ADD COLUMN IF NOT EXISTS` (this is how the agentic `evaluations` columns land). Deploy the **API before the evaluator worker** so the columns exist before the worker's by-name inserts reference them.
 
-### Redis — used by `routes/optimize/` and `db_queues/kafka/`
+### Redis — used by `shared/cache.py`, `routes/demo/`, and `db_queues/kafka/`
 
-1. **SDK cache proxy** — `/optimize/cache` GET/POST namespace keys per-org (`fluiq:{org_id[:8]}:{key}`) with TTL.
+1. **Dashboard response cache** — `cached_json()` / `dash_key()` memoise expensive ClickHouse reads for a few seconds.
 2. **Reply correlation** — the synchronous Kafka request/reply paths (`security_check_sync`, `response_gate_check`, playground eval) correlate replies by `correlation_id`.
 
-`REDIS_SDK_URL` is the URL handed back to the SDK in the cache profile (may differ from the internal `REDIS_URL`).
+A single `REDIS_URL` covers both. The SDK-facing `REDIS_SDK_URL` went away with the optimization pillar.
 
 ---
 
@@ -231,16 +230,6 @@ Per-org Slack alerting stored in `alert_settings`. `GET/PUT /alerts` configure i
 
 ---
 
-## Optimization Layer — `routes/optimize/__init__.py`
-
-- `GET /optimize/profile` (SDK, API key, **Team+**) — returns `REDIS_SDK_URL`, per-org key prefix, hot models, TTL, and an estimated hit rate derived from ClickHouse traffic.
-- `GET /optimize/cache/{key}` & `POST /optimize/cache` (SDK proxy) — Redis GET/SET, org-namespaced.
-- `GET /optimize/cache-stats` (JWT) — Redis hit/miss by cache kind.
-- `GET /optimize/prompt-cache-stats` (JWT) — provider prefix-cache token aggregates (Anthropic read/creation + OpenAI/Gemini cached).
-- `GET /optimize/evals` (SDK, API key) — CI eval gate (recent scores, pass/fail vs threshold).
-
----
-
 ## Prompt Management — `routes/prompts/__init__.py`
 
 CRUD + versioned templates. Every update creates a new version; previous versions are preserved and restorable. Prompts are promoted into named **environments** (`development`/`staging`/`production`) independently via `/environments/{env}`; `/deploy` is the legacy `{deploy: bool}` toggle. `GET /prompts/fetch/{slug}?env=` is the SDK read path used by `fluiq.fetch_prompt()`.
@@ -295,7 +284,7 @@ Admins can adjust a single org's eval allowance via `organizations.eval_quota_bo
 (`max(0, tier_quota + bonus)`; unlimited tiers stay unlimited), and the adjustment
 endpoint invalidates the org's cache so it applies on the next `/ingest`.
 
-Feature gates: `fluiq.eval()` warn mode is open to all; `fluiq.secure()` / `/secure/check` are open to all and metered by scan volume (`TIER_SECURITY_QUOTAS`); `/optimize/profile` and `fluiq.optimize()` require **Team+**; security alerts require **Growth+**, eval alerts **Team+**.
+Feature gates: `fluiq.eval()` warn mode is open to all; `fluiq.secure()` / `/secure/check` are open to all and metered by scan volume (`TIER_SECURITY_QUOTAS`); security alerts require **Growth+**, eval alerts **Team+**.
 
 ---
 
@@ -343,7 +332,6 @@ fluiq-api/
 │   ├── api_keys/             # API key CRUD
 │   ├── agents/               # /agents/summary
 │   ├── quota/                # /quota
-│   ├── optimize/             # cache stats, profile, Redis proxy, CI eval gate
 │   ├── secure/               # /secure/check pre-call guard (+ scanners.py)
 │   ├── guardrails/           # guardrail policy CRUD
 │   ├── alerts/               # Slack alert config + test

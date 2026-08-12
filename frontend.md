@@ -32,7 +32,8 @@ src/
 │   ├── pricing/ contact/ privacy/ terms/
 │   ├── documentation/ examples/   # SDK docs (Python/TS language toggle)
 │   ├── integrations/ blog/
-│   ├── observability/ security/ evaluation/ optimization/ prompts/  # pillar landing pages
+│   ├── security/ observability/ evaluation/ datasets/ prompts/  # pillar landing pages
+│   │                         #   (datasets + prompts are part of Evaluation)
 │   ├── *-alternative/        # comparison pages (langfuse, langsmith, helicone,
 │   │                         #   braintrust, lakera, portkey)
 │   ├── llm-cost-calculator/  # tool page (uses /models)
@@ -45,7 +46,7 @@ src/
 │   └── dashboard/            # authenticated app (see below)
 ├── screens/                  # presentational components rendered by routes
 │   ├── Dashboard/{Agents,Alerts,ApiManagement,Audit,Datasets,GettingStarted,
-│   │              Guardrails,Insights,JudgePrompts,Optimize,Overview,Profile,
+│   │              Guardrails,JudgePrompts,Overview,Profile,
 │   │              Prompts,Security,Tests,Traces,UserManagement}
 │   ├── Home/ Pricing/ Comparisons/ Platform/ Tools/ Documentation/
 │   ├── Integrations/ Blog/ Authentication/ Legal/ Admin/
@@ -118,13 +119,12 @@ block. There is no mobile variant — the whole nav is desktop-only.
 
 | Route | Screen | Purpose |
 |-------|--------|---------|
-| `/dashboard/overview` | Overview | Usage, quota, spending, cache-hit & agentic-eval summary tiles |
+| `/dashboard/overview` | Overview | Usage, quota, spending & agentic-eval summary tiles |
 | `/dashboard/traces` | Traces | Trace list, detail drawer, span/architecture tree, live SSE, tool selection; the drawer's Evaluation tab runs eval right there (`TraceEvalConfig`): a **single-run** trace (one LLM turn, even with tool calls) shows a metric-chip + custom-scorer picker → `POST /evaluate/trace-metrics`, while a **multi-run** trace (2+ LLM/agent turns) shows the agentic depth/judge/jury config → **Run Agentic Evaluation** (`POST /evaluate/agentic`); both gate on a BYOK provider-key add-key flow; **AnnotateBar** (thumbs + note → `POST /traces/{id}/annotations`); human feedback/annotation rows render with end-user/team badges; per-score **Judge prompts** block shows the exact rendered prompt + version/source behind every eval |
 | `/dashboard/agents` | Agents | Per-agent cost / token / latency rollup |
 | `/dashboard/security` | Security | Security risk panel; agentic threat verdicts |
 | `/dashboard/guardrails` | Guardrails | Guardrail policy editor |
 | `/dashboard/alerts` | Alerts | Slack alert configuration |
-| `/dashboard/optimize` | Optimize | Redis cache stats; MCP cache; Prompt Caching card |
 | `/dashboard/tests` | Tests | Eval scores, CI gate status, dataset management, playground |
 | `/dashboard/prompts` | Prompts | Template editor, version history, env deployments, playground; Save form has a **Completion / Judge** type toggle — Judge prompts (`kind='judge'`) are client-authored LLM-as-judges referenced by slug in `fluiq.eval(custom_judges=…)` |
 | `/dashboard/datasets` | Datasets | Named trace collections for regression testing; batch runs (**agentic / security / metrics** — metric picker chips), per-run report, and a **Compare vs…** selector producing a run-vs-run regression view (per-metric deltas, regressed examples) |
@@ -274,7 +274,6 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 |--------|----------|-------------|
 | Overview | `GET /api/v1/quota` | Quota usage by tier |
 | Overview | `GET /api/v1/traces/spending` | Spending rollup |
-| Overview | `GET /api/v1/optimize/cache-stats?window_hours=24` | Cache hit rate |
 | Traces | `GET /api/v1/traces?…` | Filtered/paginated trace list |
 | Traces | `POST /api/v1/traces/rollups` | Per-run cost/quality/security/count roll-ups (root rows) |
 | Traces | `GET /api/v1/traces/stream` | Realtime SSE stream |
@@ -283,7 +282,6 @@ All dashboard calls use `authFetch`. Screen-specific types live alongside each s
 | Guardrails | `GET /api/v1/guardrails` · `GET /api/v1/guardrails/list` | Read policy / slugs |
 | Guardrails | `PUT /api/v1/guardrails?slug=` · `DELETE /api/v1/guardrails?slug=` | Save / delete |
 | Alerts | `GET /api/v1/alerts` · `PUT /api/v1/alerts` · `POST /api/v1/alerts/test` | Slack alert config |
-| Optimize | `GET /api/v1/optimize/cache-stats` · `GET /api/v1/optimize/prompt-cache-stats` | Cache stats |
 | Tests | `GET /api/v1/traces` (filtered) · `POST /api/v1/evaluate/playground` | Eval scores / playground |
 | Datasets | `GET/POST /api/v1/datasets`, `…/examples?limit=&offset=` | Dataset + example management (paginated) |
 | Datasets | `GET …/examples/{id}/trajectory` | Pinned trajectory viewer (steps · agents · tools · MCP · media) |
@@ -447,4 +445,4 @@ SSE event names: `ready`, `ping`, `trace`, `trace.started`, `trace.enriched`.
 - **`authFetch` errors** — `ApiError.detail` surfaced in component state.
 - **SSE fatal errors** — `FatalSseError` captured by `useRealtimeStream`, rendered with context-specific messaging (quota exceeded, auth failure, server error).
 - **Token expiry** — handled silently by `authFetch` (single refresh before logout).
-- **Quota exhausted (402)** — surfaces as an upgrade prompt; `/secure/check` returns it once the org has spent its monthly scan allowance, not because of its plan (Growth+ required), and `/optimize/profile` gates Free (Team+ required).
+- **Quota exhausted (402)** — surfaces as an upgrade prompt; `/secure/check` returns it once the org has spent its monthly scan allowance, not because of its plan.

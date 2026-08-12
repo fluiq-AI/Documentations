@@ -98,9 +98,9 @@ BYOK are genuinely ahead of most competitors.
    conversation-level completeness (DeepEval conversational). Our agentic layer
    covers trajectory but not whole-conversation quality.
 
-9. **Eval-driven prompt optimization.** Auto-suggest better prompts from eval
-   scores (Braintrust Loop, DSPy-style). Our `optimize` is caching/cost only, not
-   quality.
+9. **Eval-driven prompt refinement.** Auto-suggest better prompts from eval
+   scores (Braintrust Loop, DSPy-style). We have no equivalent; the former
+   `fluiq.optimize()` was caching/cost only and has since been removed.
 
 ### Tier 3 — nice-to-have
 

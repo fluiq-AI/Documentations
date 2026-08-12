@@ -1,6 +1,6 @@
 # FluiqAI — Business Plan
 
-> *The only LLM observability platform with built-in security, evaluation, and cost optimization — shipped as a single SDK line.*
+> *The control plane for AI agents in production: security, observability, and evaluation — shipped as a single SDK line.*
 
 ---
 
@@ -26,7 +26,7 @@
 
 Every company building AI products today faces the same three invisible crises: they cannot see what their LLMs are actually doing, they cannot trust that outputs are accurate, and they have no idea whether their prompts are being attacked.
 
-**FluiqAI** solves all three with a single SDK integration. Developers call `fluiq.instrument()`, `fluiq.eval()`, `fluiq.secure()`, and `fluiq.optimize()` and immediately get a production-grade observability, evaluation, security, and cost-optimization stack — without changing their application logic.
+**FluiqAI** solves all three with a single SDK integration. Developers call `fluiq.instrument()`, `fluiq.secure()`, and `fluiq.eval()` and immediately get a production-grade security, observability, and evaluation stack — without changing their application logic.
 
 FluiqAI is a **SaaS LLMOps platform** targeting AI-native startups, enterprise AI teams, and developer agencies building production LLM applications. We charge on a usage + seat model, with a generous free tier for developer adoption and a security tier that unlocks paid conversion.
 
@@ -53,8 +53,7 @@ When a company deploys a chatbot, RAG pipeline, or autonomous agent, they have v
 
 - **Hallucinations** erode user trust silently — the company often learns about them from customer complaints, not logs
 - **Prompt injection attacks** are surging as LLMs are wired into databases, email, and financial systems
-- **Redundant LLM calls** silently inflate monthly cloud bills — teams often pay for the same completion 10× a day
-- **Provider prompt caching is unconfigured** — Anthropic prefix caching can cut input costs by 90% but requires explicit setup most teams skip
+- **Spend is unattributed** — bills arrive as one number, with no way to trace cost back to the agent node or prompt version that caused it
 - **Evaluation is ad hoc** — most teams rely on manual spot-checks or fragile regex tests
 
 ### 2.3 The current tools are fragmented
@@ -65,16 +64,15 @@ Existing solutions force teams to stitch together separate tools for tracing, ev
 
 ## 3. The Solution
 
-FluiqAI is a **unified LLMOps platform** delivered through a thin Python SDK. One `instrument()` call, full stack coverage.
+FluiqAI is a **unified LLMOps platform** delivered through a thin Python SDK, standing on three pillars — security, observability, and evaluation. Dataset management and prompt management sit inside evaluation. One `instrument()` call, full stack coverage.
 
 ```python
 import fluiq
 
 fluiq.instrument(api_key="flq_...")  # patches every supported provider automatically
 
-# Optional: layer on security, optimization, and evaluation
-fluiq.secure(mode="block")           # block prompt injection, PII leaks, agentic attacks (Growth+)
-fluiq.optimize()                     # Redis caching + Anthropic prompt-prefix injection (Team+)
+# Optional: layer on security and evaluation
+fluiq.secure(mode="block")           # block prompt injection, PII leaks, agentic attacks
 fluiq.eval(metrics=["hallucination", "relevance"], mode="warn")
 ```
 
@@ -82,7 +80,7 @@ That setup activates:
 - **Real-time trace collection** — every prompt, response, latency, cost, and token count
 - **Automatic evaluation** — LLM-judge scoring for hallucination, faithfulness, relevance, toxicity, coherence, plus **agentic evaluation** of whole agent runs (tool-selection correctness, trajectory/goal-completion, and multi-agent coordination), with judge **calibration** against a human golden set
 - **Security scanning** — PII, prompt injection, jailbreak, skeleton key, secrets, indirect injection, plus agentic threats (RAG poisoning, tool-input exfiltration, tool-allowlist violations, cross-agent injection, trust-boundary escalation) and a response gate
-- **Cost optimization** — semantic Redis cache + provider-level prompt prefix caching (Anthropic auto-injection, OpenAI/Gemini token capture) + MCP tool result caching
+- **Cost attribution** — per-node token counts and USD cost at live provider rates, including provider prompt-cache tokens (Anthropic cache_read/creation, OpenAI/Gemini cached), so the reported figure matches the bill
 
 Everything flows through a Kafka-backed async pipeline to ClickHouse, with a real-time dashboard for instant visibility.
 
@@ -105,7 +103,7 @@ Everything flows through a Kafka-backed async pipeline to ClickHouse, with a rea
 - **Automatic evaluation** on every LLM trace (warn mode, server-side) or as a blocking guard (block mode)
 - SDK metrics: Hallucination, Faithfulness, Relevance, Toxicity, Coherence, Completeness; the evaluator worker additionally supports RAGAS-family metrics (Answer Relevancy, Context Precision, Context Recall) for retrieval traces
 - LLM-judge powered, configurable judge model (defaults to `claude-haiku-4-5`); all judging runs server-side in the evaluator worker
-- GitHub Actions CI/CD gate: `GET /api/v1/optimize/evals` returns recent scores; fail the build if quality drops
+- GitHub Actions CI/CD gate: `GET /api/v1/evaluate/recent-evals` returns recent scores; fail the build if quality drops
 - Results streamed to dashboard alongside traces via SSE — single pane of glass; prompt playground + model-compare endpoints for ad-hoc evaluation
 
 #### `fluiq.secure()` — Security (Growth plan+)
@@ -116,16 +114,6 @@ Everything flows through a Kafka-backed async pipeline to ClickHouse, with a rea
 - Semantic attack classifier (torch + spaCy) running in a **dedicated security worker** on its own Kafka topic — isolates heavy ML deps from the evaluator
 - **Guardrail policies**: named, dashboard-configurable policies controlling block/warn thresholds, blocked categories, PII-ignore list, tool allowlist, custom allow/deny lists, response-gate toggle, and an alert webhook
 - Results merged into the trace view; block or warn mode; fail-open guarantee (scan outage never blocks production traffic)
-
-#### `fluiq.optimize()` — Cost Reduction (Team plan+)
-- **LLM response cache**: trace-driven Redis caching; Fluiq's backend provisions dedicated Redis per org based on real traffic patterns; zero infrastructure to manage
-- **MCP tool caching**: `ClientSession.list_tools()` and `call_tool()` results cached transparently — list_tools invalidated on server restart; call_tool keyed by `(server_url, tool_name, args_hash)`
-- **Provider prompt caching**:
-  - *Anthropic*: auto-injects `cache_control: {"type": "ephemeral"}` on system prompt and last tool — up to 90% savings on repeated system-prompt tokens
-  - *OpenAI*: captures `cached_tokens` from `usage.prompt_tokens_details` automatically (no injection needed; OpenAI caches prompts ≥ 1024 tokens)
-  - *Gemini*: captures `cached_content_token_count` from `usage_metadata` for `CachedContent`-backed calls
-- **Optimize dashboard**: Redis hit rate by cache type (LLM, MCP, embeddings, vectorstore), Prompt Caching card with per-provider token savings
-- `observe` mode: measures projected savings without serving cached responses
 
 ### 4.2 Architecture (Why It's Fast and Safe)
 
@@ -155,7 +143,6 @@ Production infra: Kafka on **AWS MSK** (SASL/SCRAM over TLS), ClickHouse self-ho
 | Security | Risk level, PII types, attack patterns (incl. agentic threats), redacted fields per trace; response gate flag |
 | Guardrails | Dashboard-configurable guardrail policies (thresholds, categories, allow/deny lists, tool allowlist, PII-ignore, webhook) |
 | Alerts | Slack alert configuration for eval and security thresholds (+ test) |
-| Optimize | Redis cache hit rate by type; MCP cache hit/miss; Prompt Caching card (cached tokens saved by provider) |
 | Tests / Evals | Per-trace quality scores; pass/fail breakdown; eval playground; dataset management |
 | Prompts | Template management, version history, environment deployments (dev/staging/prod), playground |
 | Datasets | Named trace collections for regression testing |
@@ -226,9 +213,9 @@ Targeting companies with at least one production LLM application that requires o
 1. **Enterprise AI adoption is accelerating** — every Fortune 500 is deploying LLM applications in 2025–2026
 2. **Regulatory pressure on AI outputs** — EU AI Act, GDPR for AI systems, and SEC guidance on AI disclosures are forcing auditability
 3. **LLM attacks are mainstream** — prompt injection is now in the OWASP Top 10 for LLMs; enterprises need documented security posture
-4. **LLM cost optimization pressure** — as AI budgets tighten, both Redis caching and provider-level prefix caching have direct CFO-level visibility
+4. **LLM cost accountability pressure** — as AI budgets tighten, per-agent, per-prompt cost attribution has direct CFO-level visibility
 5. **RAG is now default architecture** — every RAG deployment needs retrieval quality evaluation
-6. **MCP adoption exploding** — Model Context Protocol is becoming the standard for tool use; MCP tool caching is a new, unaddressed cost center
+6. **MCP adoption exploding** — Model Context Protocol is becoming the standard for tool use, and tool-level security and evaluation are largely unaddressed
 
 ---
 
@@ -236,16 +223,16 @@ Targeting companies with at least one production LLM application that requires o
 
 ### 6.1 Landscape Overview
 
-| Platform | Tracing | Evaluation | Security | Optimization | Prompt Cache | MCP Cache | Pricing Start | Open Source |
-|---|---|---|---|---|---|---|---|---|
-| **FluiqAI** | ✅ | ✅ Full suite | ✅ **PII + injection + response gate** | ✅ Redis + provider | ✅ Auto-inject | ✅ | Free | ❌ |
-| Langfuse | ✅ | ✅ Basic | ❌ | ❌ | ❌ | ❌ | Free / $59/mo | ✅ |
-| LangSmith | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | Free / $39/mo | ❌ |
-| Braintrust | ✅ | ✅ Strong | ❌ | ❌ | ❌ | ❌ | Free / custom | ❌ |
-| Arize / Phoenix | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | Free / custom | ✅ Phoenix |
-| Helicone | ✅ Proxy | ❌ | ❌ | ✅ Rule-based | ❌ | ❌ | Free / $80/mo | ✅ |
-| Portkey | ✅ Proxy | ❌ | Partial | ✅ Semantic | ❌ | ❌ | Free / $49/mo | ❌ |
-| Galileo | ✅ | ✅ Strong | ❌ | ❌ | ❌ | ❌ | $50K+/yr | ❌ |
+| Platform | Tracing | Evaluation | Agentic Eval | Security | Datasets | Pricing Start | Open Source |
+|---|---|---|---|---|---|---|---|
+| **FluiqAI** | ✅ | ✅ Full suite | ✅ **Trajectory + jury** | ✅ **PII + injection + response gate** | ✅ Whole-trajectory | Free | ❌ |
+| Langfuse | ✅ | ✅ Basic | ❌ | ❌ | ✅ | Free / $59/mo | ✅ |
+| LangSmith | ✅ | ✅ | Partial | ❌ | ✅ | Free / $39/mo | ❌ |
+| Braintrust | ✅ | ✅ Strong | Partial | ❌ | ✅ | Free / custom | ❌ |
+| Arize / Phoenix | ✅ | ✅ | Partial | ❌ | ✅ | Free / custom | ✅ Phoenix |
+| Helicone | ✅ Proxy | ❌ | ❌ | ❌ | ❌ | Free / $80/mo | ✅ |
+| Portkey | ✅ Proxy | ❌ | ❌ | Partial | ❌ | Free / $49/mo | ❌ |
+| Galileo | ✅ | ✅ Strong | Partial | ❌ | ✅ | $50K+/yr | ❌ |
 | W&B Weave | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | Free / custom | ❌ |
 
 ### 6.2 Deep Competitor Profiles
@@ -264,7 +251,6 @@ Targeting companies with at least one production LLM application that requires o
 **Weaknesses**
 - Evaluation is manual-first — no automatic LLM-judge on every trace
 - Zero security capability — no PII scanning, no attack detection, no response gate
-- No cost optimization / caching layer of any kind
 - Self-hosting burden is significant for small teams
 - Open-source model limits monetization leverage
 
@@ -300,7 +286,7 @@ Targeting companies with at least one production LLM application that requires o
 
 **Weaknesses**
 - Primarily offline evaluation — not real-time production monitoring
-- No security, no response gate, no cost optimization
+- No security, no response gate, no production guardrails
 - Pricing is opaque and enterprise-only at scale
 
 **Why customers leave Braintrust for FluiqAI**: They need real-time production monitoring, not just pre-deployment eval, plus security compliance.
@@ -311,16 +297,15 @@ Targeting companies with at least one production LLM application that requires o
 **Positioning**: AI gateway with observability, routing, and semantic caching.
 
 **Strengths**
-- Semantic caching via proxy (similar to Fluiq's Redis cache)
 - Model routing and fallback logic
+- Semantic caching at the gateway
 - Good multi-provider support
 - Reasonable pricing at entry level
 
 **Weaknesses**
 - **Proxy architecture** — routes all traffic through their servers (security and compliance risk)
-- No LLM-as-judge evaluation
+- No LLM-as-judge evaluation, and no agentic/trajectory evaluation at all
 - No real security scanning (basic guardrails only, no PII or injection detection)
-- No provider prompt-cache injection or MCP caching
 - Proxy adds latency to every call
 
 **Why customers leave Portkey for FluiqAI**: Proxy model is a non-starter for enterprise compliance; no real security or evaluation.
@@ -355,7 +340,6 @@ Targeting companies with at least one production LLM application that requires o
 **Weaknesses**
 - Enterprise-only pricing (typically $50K+/year) — no developer tier, no self-serve
 - No security scanning; no response gate
-- No cost optimization
 - Long sales cycles, not PLG
 
 **Why customers don't start with Galileo**: Price and sales process. A startup can't pay $50K/year on day one.
@@ -371,9 +355,9 @@ Targeting companies with at least one production LLM application that requires o
 | Real-time tracing (all providers + MCP + vectorstores) | ✅ | ✅ (most, limited) |
 | Auto evaluation on every trace | ✅ | Partial (usually manual) |
 | **Production security: PII + injection + response gate** | ✅ | ❌ |
-| **Redis semantic cache** | ✅ | Partial (Helicone/Portkey, proxy only) |
-| **Anthropic prompt-prefix injection** | ✅ | ❌ |
-| **MCP tool result caching** | ✅ | ❌ |
+| **Agentic evaluation of whole runs (tools, trajectory, coordination)** | ✅ | Partial |
+| **Multi-model judge jury with per-member audit trail** | ✅ | ❌ |
+| **Whole-trajectory golden datasets (retention-independent)** | ✅ | ❌ |
 | **Provider cached token capture (all 3 providers)** | ✅ | ❌ |
 
 No competitor offers all of this. Most offer two or three capabilities at most.
@@ -387,28 +371,28 @@ The LLM security space is essentially uncontested in the observability category.
 - The response gate requires synchronous ingest — it is architecturally incompatible with proxy-based competitors (they cannot add it without fundamental redesign)
 - Security data is deeply integrated with trace data — you cannot replicate this with a bolt-on tool
 
-### 7.3 Cost Optimization Depth
+### 7.3 Agentic Evaluation Depth
 
-Our optimization layer has three independent dimensions:
-1. **Redis semantic caching** — same response, zero LLM cost
-2. **Provider prompt prefix caching** — Anthropic auto-injection reduces input token cost by up to 90% on repeated system prompts
-3. **MCP tool caching** — in agentic systems, `list_tools()` and `call_tool()` can dominate latency; caching both is unique to us
+Competitors score single responses. We score the run:
+1. **Tool selection** — was the right tool chosen, with the right arguments, at the right step
+2. **Trajectory vs goal** — did the path the agent took actually serve the stated objective
+3. **Multi-agent coordination** — fan-outs, joins, and handoffs judged across the real DAG, not a flattened list
 
-Together these deliver measurable savings across every dimension of an LLM application's cost structure. No competitor touches more than one.
+Borderline verdicts convene a multi-model jury, and every member's score and reasoning is kept for audit. Golden datasets pin the whole trajectory, so a run stays evaluable long after its trace ages out of retention — that pairing (agentic judge + retention-independent trajectories) is the regression gate no competitor ships.
 
 ### 7.4 Thin SDK + Server-Side Architecture
 
 Our SDK does one thing: wraps calls and sends data. All compute is server-side. This means:
-- Upgrading FluiqAI (new evaluators, better PII models, new attack signatures, new cache strategies) requires **zero SDK updates**
+- Upgrading FluiqAI (new evaluators, better PII models, new attack signatures, new judge prompts) requires **zero SDK updates**
 - Competitors with fat SDKs create update friction and compatibility headaches
 - The thin SDK is also a security argument — we're not shipping ML models into customer environments
 
 ### 7.5 Unified Data Model = Network Effects
 
-Because tracing, evaluation, security, and optimization all live in the same ClickHouse trace record, we can build cross-cutting insights no siloed tool can match:
+Because tracing, evaluation, and security all live in the same ClickHouse trace record, we can build cross-cutting insights no siloed tool can match:
 - "Show me traces where hallucination score is high AND a security risk was detected"
-- "Which MCP tools have the highest cache hit rate?"
-- "What percentage of Anthropic cache_read savings came from system-prompt injection?"
+- "Which tools does this agent pick when its trajectory score drops?"
+- "Which prompt version regressed after last week's model change?"
 
 This unified data model deepens as usage grows, making churn progressively harder.
 
@@ -420,7 +404,7 @@ This unified data model deepens as usage grows, making churn progressively harde
 
 - **Observability is free and unlimited on every tier** — no trace/span/agent cap, ever. This is the top-of-funnel: teams instrument freely and only feel a paid boundary once they need history.
 - **Retention is the primary paid axis** — Free keeps a rolling 14-day window; paid keeps traces forever. Simple to explain, and it converts on genuine need (incident forensics, regression datasets, compliance) rather than an artificial cap.
-- **Optimization unlocks at Team; security unlocks at Growth** — the two additional paid value drivers ladder customers up the plans
+- **Eval volume, seats, and alerting ladder customers up the plans** — security is available on every tier and metered by scan volume rather than gated behind one
 - **A no-card 5-day trial** of a paid tier lets teams feel unlimited retention (and higher eval budgets) before deciding
 - Simple, transparent pricing — no "contact sales" required below Enterprise
 
@@ -443,8 +427,7 @@ Full observability for your first pipeline. No credit card required.
 | Supported providers | OpenAI, Anthropic, Gemini, Vertex AI, Voyage; LangChain, LangGraph, LlamaIndex, CrewAI, Google ADK, MCP; all vectorstores |
 | Trace explorer & live dashboard | ✅ |
 | `fluiq.eval()` (warn mode) + GitHub Action CI/CD eval gates | ✅ |
-| `fluiq.optimize()` | ❌ |
-| `fluiq.secure()` | ❌ |
+| `fluiq.secure()` | ✅ (1,000 scans / month) |
 | Support | Community |
 
 ---
@@ -452,7 +435,7 @@ Full observability for your first pipeline. No credit card required.
 #### Team ⭐ Most Popular
 **$499 / workspace / month**
 
-Unlimited tracing, response caching, and provider prompt caching for teams shipping production AI pipelines.
+Unlimited tracing with never-expiring retention and a real eval budget, for teams shipping production AI pipelines.
 
 | Feature | Detail |
 |---|---|
@@ -461,9 +444,9 @@ Unlimited tracing, response caching, and provider prompt caching for teams shipp
 | LLM-as-judge evaluations | 10,000 / month |
 | Seats | 10 (+ $49 / extra seat) |
 | Everything in Free | ✅ |
-| `fluiq.optimize()` — Redis cache + Anthropic prompt-prefix injection + MCP caching | ✅ |
+| Dataset batch runs (agentic / security / metrics) + run-vs-run regression compare | ✅ |
 | Eval alerts to Slack | ✅ |
-| `fluiq.secure()` | ❌ (Growth+) |
+| `fluiq.secure()` | ✅ (higher scan volume) |
 | Support | Priority |
 
 ---
@@ -514,8 +497,8 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 **Tactics:**
 
 1. **Content marketing & SEO**
-   - Publish weekly technical content: "How to detect prompt injection in production", "Why your RAG pipeline is hallucinating", "LLM cost optimization: how we cut our OpenAI bill by 60%", "Anthropic prompt caching: the 90% savings most teams are leaving on the table"
-   - Target keywords: "llm observability", "prompt injection detection", "llm evaluation python", "openai tracing", "anthropic prompt caching"
+   - Publish weekly technical content: "How to detect prompt injection in production", "Why your RAG pipeline is hallucinating", "Scoring an agent's trajectory, not just its answer", "Building a golden dataset from production traffic"
+   - Target keywords: "llm observability", "prompt injection detection", "llm evaluation python", "agent trajectory evaluation", "openai tracing"
    - Goal: 5,000 organic monthly visitors within 6 months
 
 2. **Developer community presence**
@@ -541,7 +524,7 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 
 1. **In-product upgrade triggers**
    - When a free user needs trace history beyond the rolling 14-day window: one-click upgrade to Team for unlimited (never-expiring) trace retention
-   - When `fluiq.optimize()` is called below Team, or `fluiq.secure()` below Growth: graceful 402 with a one-click upgrade to the unlocking plan
+   - When a monthly security-scan or eval allowance is exhausted: graceful 402 with a one-click upgrade to the next plan
    - When an LLM eval quota is exhausted mid-month: prompt to upgrade
 
 2. **Security-led enterprise upsell**
@@ -549,9 +532,9 @@ Compliance, on-prem deployment, and a dedicated success engineer.
    - Position `fluiq.secure()` + response gate as the complete answer
    - Partner with AI compliance consultants advising companies on EU AI Act readiness
 
-3. **Cost savings story**
-   - Anthropic prefix caching auto-injection is a uniquely compelling demo: a single `fluiq.optimize()` call can cut input token bills by 50–90% for prompts with large system prompts
-   - Use the Optimize dashboard Prompt Caching card as the sales artifact
+3. **Regression-gate story**
+   - Connect an agent, import its whole run history into a dataset, and batch-evaluate it: a concrete before/after on a prompt or model change in one demo
+   - Use the run-vs-run compare view as the sales artifact
 
 4. **Outbound to AI-first companies**
    - Target Series A–C AI-native startups (AngelList, Crunchbase)
@@ -583,7 +566,7 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 
 4. **TypeScript SDK**
    - Python captures the ML/AI developer; TypeScript captures the application developer building LLM features in Node.js/Next.js backends
-   - TypeScript SDK mirrors the Python SDK's security and optimization capabilities
+   - TypeScript SDK mirrors the Python SDK's security and evaluation capabilities
 
 ---
 
@@ -595,11 +578,11 @@ Compliance, on-prem deployment, and a dedicated success engineer.
 
 **FluiqAI is**: a unified LLMOps platform
 
-**That**: instruments any LLM call with tracing, automatic evaluation, security scanning (including response gate), and cost optimization (Redis cache + provider prompt-prefix caching + MCP tool caching) through a single SDK integration
+**That**: instruments any LLM call with tracing and cost attribution, security scanning (including response gate), and evaluation — from single-response LLM-as-judge to whole-run agentic judging against golden datasets — through a single SDK integration
 
 **Unlike**: Langfuse, LangSmith, and Braintrust which require separate tools for evaluation and have no security capability; and Helicone/Portkey which route all traffic through a proxy
 
-**FluiqAI**: delivers the complete LLMOps stack — observe, evaluate, secure, optimize — in one platform that takes 5 minutes to integrate and never touches your API keys
+**FluiqAI**: delivers the complete LLMOps stack — secure, observe, evaluate — in one platform that takes 5 minutes to integrate and never touches your API keys
 
 ---
 
@@ -646,9 +629,8 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 ### 11.1 Current State (Platform Complete)
 
 - **Python SDK**: thin, fail-open instrumentation client covering OpenAI, Anthropic, Gemini, Vertex AI, Voyage; LangChain, LangGraph, LlamaIndex, CrewAI, Google ADK, MCP; Chromadb, Pinecone, Qdrant, Weaviate, FAISS
-- **TypeScript SDK** (`@fluiq/sdk`): mirrors the Python surface — all integrations + 5 vectorstores, server-side eval/security, Redis optimize; published via npm Trusted Publishing
+- **TypeScript SDK** (`@fluiq/sdk`): mirrors the Python surface — all integrations + 5 vectorstores, server-side eval/security; published via npm Trusted Publishing
 - **Security**: PII (Presidio), prompt injection, jailbreak, skeleton key, secrets, indirect injection, semantic attacks; **agentic threats** — RAG poisoning, tool-input exfiltration, tool-allowlist violations, cross-agent injection, DAG-keyed trust-boundary escalation / session crescendo; response gate; dashboard-configurable guardrail policies. Runs in a dedicated security worker on its own Kafka topic
-- **Optimization**: Redis semantic cache (trace-driven profile); MCP `list_tools()` and `call_tool()` caching; Anthropic `cache_control` auto-injection; OpenAI and Gemini cached-token capture; Optimize dashboard with Prompt Caching card
 - **Evaluation**: hallucination, faithfulness, relevance, toxicity, coherence, completeness (+ RAGAS-family for retrieval); warn and block modes; playground + model-compare; GitHub Actions CI gate
 - **Prompts**: template management, version history, environment deployments (dev/staging/prod), LLM-as-judge playground, `fetch_prompt()` runtime API
 - **Datasets**: trace collection management for regression testing
@@ -656,7 +638,7 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 - **Auth & admin**: password + Google/GitHub OAuth, OTP password reset, tamper-evident (HMAC) audit log, admin console
 - **Marketing surfaces**: in-house blog CMS (prerender-on-publish SEO, S3 media), LLM cost calculator, pillar + competitor-comparison pages
 - **Open-source companions** (§4.4): **polygate** (unified LLM client, PyPI + npm) and **Infrager** (diagram → Terraform with security linting, AWS + GCP), both live, MIT, and free; Infrager reuses the existing ECS/ALB/RDS footprint
-- **Dashboard**: 13+ pages, real-time SSE streaming, dark mode, full observe/secure/eval/optimize coverage
+- **Dashboard**: 11+ pages, real-time SSE streaming, dark mode, full secure/observe/eval coverage
 - **Async pipeline & infra**: three Kafka workers (tracer, evaluator, security); self-hosted Kafka on EC2 (migrated off MSK to cut ~87% of that line item), self-hosted ClickHouse on EC2, PostgreSQL on RDS, Redis, S3; per-run roll-ups (AggregatingMergeTree); Fargate-Spot autoscaling to a ~$150/mo budget; cost estimation with provider rates
 
 ### 11.2 Roadmap
@@ -664,7 +646,6 @@ Blended ARPU assumes a paying-customer mix of ~70% Team, ~25% Growth, ~5% Enterp
 **2025 — Launch ✅ (Complete)**
 - ~~Public beta; Free / Team / Growth plans live~~
 - ~~Security: PII, injection, jailbreak, response gate, guardrail policies~~
-- ~~Optimization: Redis cache, MCP caching, provider prompt caching~~
 - ~~Evaluation: metrics suite, CI/CD gate, warn + block modes~~
 - ~~Prompts: templates, versioning, environments, playground · Datasets~~
 
@@ -729,6 +710,6 @@ Every layer of FluiqAI was built by Saurabh directly: the SDK, the API, the Kafk
 
 ---
 
-*FluiqAI — Observe. Evaluate. Secure. Optimize.*
+*FluiqAI — Secure. Observe. Evaluate.*
 
 *© 2026 FluiqAI. All rights reserved.*
