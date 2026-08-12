@@ -165,7 +165,7 @@ text-only. Add it via `fluiq.eval(metrics=["vision_faithfulness"])`.
 
 Single-shot metrics can't answer *"did the agent call the right tool with the
 right arguments, and did the whole run accomplish the goal?"* That needs the
-**agentic** pipeline (`jobs/agentic/`). It runs in four layers, cheapest first.
+**agentic** pipeline (`jobs/agentic/`). It runs in layers, cheapest first.
 
 ### The big picture
 
@@ -200,6 +200,17 @@ right arguments, and did the whole run accomplish the goal?"* That needs the
                           |   | "Right tool? Right arguments for the |   |
                           |   |  goal?" -> per-call verdict + score  |   |
                           |   |  (blended 70% judge / 30% det)       |   |
+                          |   +------------------+-------------------+   |
+                          |                      v                       |
+                          |   L2.5  RETRIEVAL & RANKING  retrieval.py    |
+                          |       (1 judge call per retrieval step)      |
+                          |   +--------------------------------------+   |
+                          |   | Graded 0-3 relevance per document,   |   |
+                          |   | then: rank-weighted precision,       |   |
+                          |   | nDCG over the retriever's ORDER, and |   |
+                          |   | did the answer actually use them?    |   |
+                          |   | Runs at every depth; skipped when    |   |
+                          |   | the run retrieved nothing.           |   |
                           |   +------------------+-------------------+   |
                           |                      v                       |
                           |   L3  TRAJECTORY  trajectory.py              |
@@ -297,6 +308,38 @@ Given the goal, the allowed tools, and the calls made, the judge rates each call
 judge so it doesn't re-derive schema problems. The final score is blended
 **70% judge / 30% deterministic** so a schema-invalid call can't be rated
 "perfect" by a lenient judge.
+
+### Layer 2.5 — Retrieval & Ranking Quality (`retrieval.py`) — 1 judge call per retrieval step
+
+Normalized from any vector-store span (`type: "vectorstore"`), preserving the
+**order** the retriever returned documents in. The judge grades each document
+against the query on a 0-3 scale, deliberately graded rather than binary,
+because nDCG degenerates under binary labels and stops distinguishing "perfect
+document at rank 3" from "barely adequate document at rank 3".
+
+Three numbers come out of those labels, each isolating a different fix:
+
+| Sub-score | What it catches | What you'd change |
+|---|---|---|
+| **Relevance** (rank-weighted precision) | The retriever returned the wrong documents | Embeddings, chunking, filters |
+| **nDCG** | It found the right document and buried it | Add or fix a reranker |
+| **Utilisation** | The answer ignored what was retrieved | The generator prompt, not the retriever |
+
+Weighted 0.5 / 0.3 / 0.2, renormalized over whichever terms were measurable.
+
+`ndcg` is reported as `null` — not `0` — in two cases, and the distinction is
+deliberate. With **fewer than two documents** any ordering is trivially perfect,
+so a 1.0 would silently inflate the layer score. With **no relevant documents at
+all**, ranking is not the defect: that is a recall failure the relevance term
+already punishes, and scoring ranking as zero would penalise one mistake twice.
+
+Metric `agentic.retrieval_quality`, layer `retrieval`, prompt
+`retrieval_quality` (admin-editable like every other judge prompt).
+
+**Cost.** One judge call per retrieval step, grading all of that step's
+documents in a single pass. The per-span `ragas.context_precision` metric issues
+one call *per document*; at agentic depth over a run with several retrievals
+that is a pathological number of calls, so this layer batches instead.
 
 ### Layer 3 — Trajectory (`trajectory.py`) — 1 judge call (depth >= standard)
 
@@ -403,9 +446,14 @@ rather than guessing at the tenant. Regression tests:
 
 | Depth (`EVAL_AGENT_DEPTH` or per-message `depth`) | Layers run | Use for |
 |------|------------|---------|
-| `fast` | L1 + L2 | high-volume streaming |
-| `standard` (default) | L1 + L2 + L3 (+ **L5** if multi-agent) | normal online eval |
-| `deep` | L1 + L2 + L3 (+ L5) + **L4 panel** | CI / audits / disputed runs |
+| `fast` | L1 + L2 (+ **L2.5** if the run retrieved) | high-volume streaming |
+| `standard` (default) | L1 + L2 + L2.5 + L3 (+ **L5** if multi-agent) | normal online eval |
+| `deep` | L1 + L2 + L2.5 + L3 (+ L5) + **L4 panel** | CI / audits / disputed runs |
+
+L2.5 is not gated behind a depth tier on purpose: a retriever that returned the
+wrong documents invalidates every layer downstream of it, so deferring that
+check to a more expensive tier would let the cheapest tier report a confident
+score on a run that was broken at its first step.
 
 ### Orchestrator (`orchestrator.py`)
 
