@@ -1,0 +1,62 @@
+[
+  {
+    "file": "post1.html",
+    "slug": "harness-engineering-agent-model-plus-harness",
+    "title": "Harness Engineering: Why Your Agent Got Better Without a Model Upgrade",
+    "excerpt": "Vivek Trivedy's team moved a coding agent from Top 30 to Top 5 on Terminal Bench 2.0 by changing only the harness. OpenAI and Anthropic published harness essays six weeks apart. Here's what the discipline actually covers — and why observability, evaluation, and enforcement aren't adjacent to your agent, they're part of it.",
+    "author": "Saurabh Kumbhar",
+    "tags": ["Harness Engineering", "AI Agents", "LLM Observability", "LangChain", "OpenAI", "Anthropic", "Agent Architecture", "LLMOps", "Production AI"],
+    "status": "published",
+    "seo_title": "Harness Engineering Explained — Agent = Model + Harness (2026)",
+    "seo_description": "Harness engineering, formalized by Vivek Trivedy and echoed by OpenAI and Anthropic, is the discipline behind agents that got better without a model upgrade. What a harness contains, why it goes stale, and why observability is a harness component.",
+    "published_at": "2026-07-03T08:15:00+00:00"
+  },
+  {
+    "file": "post2.html",
+    "slug": "loop-engineering-inner-outer-agent-loops",
+    "title": "Your Agent Has No Brakes: Notes on Loop Engineering",
+    "excerpt": "Everyone designs the agent loop. Almost nobody designs what stops it. Field notes on inner-loop back-pressure versus outer-loop observation, the 'success is silent, failures are verbose' pattern, and why a multi-turn jailbreak like Crescendo is invisible to anything that sees one request at a time.",
+    "author": "Saurabh Kumbhar",
+    "tags": ["Loop Engineering", "AI Agents", "ReAct", "Agent Design", "LLM Security", "Crescendo", "LLMOps", "Python", "Production AI"],
+    "status": "published",
+    "seo_title": "Loop Engineering: Inner-Loop Back-Pressure vs Outer-Loop Observation",
+    "seo_description": "Loop engineering is designing the agent's iteration cycle, not just the prompt. Inner loop blocks and raises; outer loop scores and accumulates. Why loops drift instead of crashing, and why trajectory-level detection beats per-turn classifiers.",
+    "published_at": "2026-07-10T07:40:00+00:00"
+  },
+  {
+    "file": "post3.html",
+    "slug": "echoleak-zero-click-prompt-injection-blast-radius",
+    "title": "EchoLeak: A Teardown of the Zero-Click Prompt Injection That Changed the Threat Model",
+    "excerpt": "CVE-2025-32711 exfiltrated internal data from Microsoft 365 Copilot with no user interaction at all. A step-by-step teardown of the chain, the 2025 CVE wave around it, and the architectural conclusion: stop trying to build a model that can't be fooled, and build the system so that when it is, nothing important breaks.",
+    "author": "Saurabh Kumbhar",
+    "tags": ["LLM Security", "Prompt Injection", "EchoLeak", "CVE-2025-32711", "MCP Security", "AI Agents", "Guardrails", "OWASP", "Production AI"],
+    "status": "published",
+    "seo_title": "EchoLeak (CVE-2025-32711): Zero-Click Prompt Injection, Explained",
+    "seo_description": "A full teardown of EchoLeak, the first documented zero-click indirect prompt injection against a production AI system — the kill chain, the 2025 CVE wave, MCP tool poisoning, cross-modal injection, and the containment surfaces that actually work.",
+    "published_at": "2026-07-16T09:05:00+00:00"
+  },
+  {
+    "file": "post4.html",
+    "slug": "llm-judge-bias-calibration-trajectory-evaluation",
+    "title": "Your Eval Number Is Measuring Your Pipeline: An Audit for LLM-as-Judge",
+    "excerpt": "Position bias, verbosity bias, self-preference bias — all named, published, and reproducible. And a 2026 variance study attributes 40–60% of judge score variance to pipeline factors rather than the thing being evaluated. Five checks you can run on your own eval pipeline in an afternoon, plus why single-output scoring stopped being enough for agents.",
+    "author": "Saurabh Kumbhar",
+    "tags": ["LLM Evaluation", "LLM-as-Judge", "Judge Calibration", "Agentic Evaluation", "tau2-bench", "DeepEval", "RAGAS", "LLMOps", "AI Quality"],
+    "status": "published",
+    "seo_title": "LLM-as-Judge Bias and Calibration — A Practical Eval Audit",
+    "seo_description": "Position, verbosity, and self-preference bias are documented and reproducible, and 40–60% of judge score variance comes from pipeline factors. A five-check audit for your eval pipeline, plus trajectory-level agentic evaluation and eval drift.",
+    "published_at": "2026-07-23T06:50:00+00:00"
+  },
+  {
+    "file": "post5.html",
+    "slug": "we-published-a-guardrail-benchmark-we-dont-win",
+    "title": "We Published a Guardrail Benchmark We Don't Win",
+    "excerpt": "Eight guardrails, four corpora, 949 cases. We came second on both output-side corpora and third on both input-side ones, and a 30-line regex control beats three of the eight contestants. Why benchmarketing is a forty-year-old problem, what makes a self-published benchmark worth reading, and the four methodology decisions that each cost us something.",
+    "author": "Saurabh Kumbhar",
+    "tags": ["Benchmarking", "LLM Security", "Guardrails", "AI Security", "Prompt Injection", "PII Redaction", "Open Source", "Research Methods", "LLMOps"],
+    "status": "published",
+    "seo_title": "Benchmarketing: Why We Published a Guardrail Benchmark We Don't Win",
+    "seo_description": "Every AI vendor benchmarks itself and wins. We ran eight guardrails over 949 cases and placed second twice and third twice, with a regex control, public corpora, and every miss listed by case ID. The credibility checklist and what it cost us to follow it.",
+    "published_at": "2026-08-07T09:30:00+00:00"
+  }
+]
