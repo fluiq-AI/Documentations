@@ -215,6 +215,35 @@ deploy → wait for stability) against its own ECR repo / ECS service. Push to
 redeploy one. See `docs/workers.md` for shared topics/auth, and
 `docs/tracer.md` / `docs/evaluator.md` / `docs/security.md` for per-worker env vars.
 
+### Judge prompts — deploy the evaluator *before* the API
+
+Both deployables seed the same table. The API seeds `eval_judge_prompts` on boot
+(`main.py` → `db_queues/postgresql/eval_prompts.py`) from its mirror
+`db_queues/postgresql/judge_prompt_defaults.py`; the evaluator seeds it too
+(`db/postgres.py`) from `jobs/helper/judge_prompts.py::_PROMPTS`. The mirror is
+generated from that registry, never hand-edited — regenerate with
+`fluiq-workers/evaluator/tools/sync_api_prompt_mirror.py`, which has a `--check`
+mode, and `tests/test_prompt_mirror_sync.py` fails when the two diverge.
+
+**When a change alters the response schema a prompt asks for, ship the evaluator
+first.** The prompts live in Postgres but the code that parses the response
+lives in the worker, so the API can put a new prompt in front of an old parser:
+
+| Order | Result |
+|-------|--------|
+| Evaluator first | Safe. `jobs/helper/base.py::judge_score` reads the new key and falls back to the legacy one, so it handles rows either seeder wrote. |
+| API first | Broken until the worker catches up. PG holds a prompt asking for the new shape while the running worker still reads the old one — judges score silently wrong, not loudly. |
+
+This bit on 2026-08-14 during the 1-5 rubric rollout (`rating` int replacing a
+`score` float): the API landed four minutes ahead of the evaluator. No data was
+affected — `evaluations` had no rows in that window — but the window was real.
+Run `--check` before pushing either repo, and if both have commits, push the
+evaluator and wait for its ECS service to stabilise first.
+
+The same asymmetry is why `judge_score`'s legacy fallback is load-bearing rather
+than courtesy: neither seeder rewrites a row with `is_overridden` set, so an org
+that edited its prompt keeps a template asking for the old shape indefinitely.
+
 ### Security worker — model weights are baked into the image
 
 Three models are downloaded at **build** time, not first use: two
