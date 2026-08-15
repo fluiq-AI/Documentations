@@ -41,7 +41,8 @@ src/
 │   │                         #   transcripts, zero inference cost (see below)
 │   ├── benchmark/            # guardrail benchmark results (see below)
 │   ├── infrager/             # landing page for Infrager (separate OSS product,
-│   │                         #   app lives at infrager.getfluiq.com)
+│   │                         #   app lives at infrager.<current domain> — see
+│   │                         #   "Sibling products" below)
 │   ├── admin/
 │   └── dashboard/            # authenticated app (see below)
 ├── screens/                  # presentational components rendered by routes
@@ -112,6 +113,37 @@ a three-column mega menu driven by `NAV_GROUPS`:
 The panel is 880px wide because at 720px every description wrapped to two lines,
 which doubled the row height and made three short columns read as one tall
 block. There is no mobile variant — the whole nav is desktop-only.
+
+`NAV_GROUPS` is built per render (`navGroups(host)`) rather than being a module
+constant, because the polygate row is a sibling-product link — see below.
+
+### Sibling products (polygate, Infrager)
+
+The marketing site answers on several domains (`getfluiq.com`, `getfluiq.dev`,
+`fluiq.net`, `fluiqai.dev`) and each one has its own `polygate.` and `infrager.`
+subdomain. Links to them are therefore never hardcoded: they resolve against the
+host being served, so a visitor on `fluiqai.dev` is sent to
+`polygate.fluiqai.dev` instead of being bounced to another domain.
+
+| Where | How |
+|-------|-----|
+| Server (`sitemap.ts`) | `siblingOrigin(sub, await getHost())` |
+| Client (`SiteFooter`, `NavDeveloperDropdown`, `Home`, `Infrager`) | `useSiblingOrigin(sub)` / `useSiteHost()` |
+| JSON-LD (`seo-pages.ts`) | authored against `CANONICAL_HOST`, rewritten by `withSite` |
+
+`src/lib/site-host.ts` holds the pure host arithmetic (`siteApex`,
+`siblingOrigin`, `SIBLING_SUBDOMAINS`) precisely because `src/lib/site-url.ts`
+imports `next/headers` and so cannot be pulled into a client bundle;
+`site-url.ts` re-exports it for server callers. The host reaches client
+components through `SiteHostProvider` in `app/providers.tsx`, fed by the root
+layout — reading `window.location` instead would render a different href on the
+server than after hydration.
+
+Hosts with no sibling subdomains — dev servers, raw IPs, `*.amplifyapp.com`
+preview URLs — fall back to `CANONICAL_HOST`, currently **`fluiqai.dev`**. That
+constant is also what `getHost()` returns when a request carries no `Host`
+header, and the domain the static JSON-LD is authored against. Changing it moves
+all three at once; nothing else should hardcode a domain.
 
 ### Dashboard routes — `src/app/dashboard/`
 

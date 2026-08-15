@@ -277,13 +277,34 @@ aws ecs update-service --cluster fluiq --service infrager-api --force-new-deploy
 
 **Config** lives in SSM as SecureStrings: `/infrager/prod/DATABASE_URL` and
 `/infrager/prod/AUTH_SECRET`, injected as task `secrets`. Plain env on the task:
-`PORT=4000`, `PGSSL=require`, `CORS_ORIGINS=https://infrager.getfluiq.com`
-(an exact origin match; a mismatch here shows up as browser CORS failures on
-signup, not as an API error). Tables are created on boot, so there is no
+`PORT=4000`, `PGSSL=require`, and `CORS_ORIGINS` — a comma-separated list
+carrying **all four** subdomains:
+
+```
+https://infrager.getfluiq.com,https://infrager.getfluiq.dev,https://infrager.fluiq.net,https://infrager.fluiqai.dev
+```
+
+Each entry is an exact origin match (`apps/api/src/config.ts` splits on `,` and
+trims), so a missing or misspelled one shows up as a browser CORS failure on
+signup, not as an API error. Tables are created on boot, so there is no
 migration step. Logs: `/ecs/infrager-api`, 14-day retention.
+
+The list is committed in the Infrager repo at `apps/api/ecs-task-def.json`, which
+is the source of truth for this task definition — unlike the fluiq services,
+whose task defs are fetched live by CI.
 
 **Marketing surface.** `getfluiq.com/infrager` (see `docs/frontend.md`) plus the
 Developer nav dropdown, homepage section, footer, and sitemap entries.
+
+Those links are host-relative (`infrager.<domain>` — see "Sibling products" in
+`docs/frontend.md`), so every domain the marketing site answers on needs its own
+`infrager.` subdomain in Amplify/DNS **and** an entry in `CORS_ORIGINS` above. A
+missing subdomain is a dead link; a missing CORS origin is a browser failure on
+signup only. All four are wired today (verified 2026-08-14): Amplify app
+`d1icguwdl9x4aw` has `infrager.` on `getfluiq.com`, `getfluiq.dev`, `fluiq.net`
+and `fluiqai.dev`, all `AVAILABLE`. Adding a fifth domain means touching both
+places. Sibling apps are wired the same way — polygate is Amplify app
+`d2248kanqn6vi4` with the same four.
 
 ---
 
